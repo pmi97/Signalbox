@@ -1,4 +1,21 @@
 # Changelog
+
+## Signalbox 0.1.0
+
+The first release of Signalbox, a fork of Kanvas 0.4.0 for teams of people and agents.
+
+- The board lives on GitHub Issues (or a local file hub): states, lanes and kinds as labels, dependencies in the issue body and mirrored as native "blocked by", notes as signed comments.
+- Interlocks: `claim` takes an atomic compare-and-swap lock on `refs/signalbox/locks/<issue>` on the shared remote, with leases, `heartbeat`, `--take-over` of expired locks and `unlock` by people.
+- Every claim gets a locked git worktree with a brief, copied untracked files, a setup command and its own port; `finish`, `pause` and `handoff` push the branch so anyone resumes it with `claim`; `gc` cleans up.
+- Lanes with owners and WIP limits, global approvers and GitHub teams; a per-agent claim limit; human decisions need a person at a terminal or the browser.
+- Wayfinder maps: `map new`, decision tickets (`research`, `prototype`, `grilling`, `task`), `frontier`, `fog`, `graduate`, `resolve` feeding *Decisions so far*, `scope-out`; HITL tickets need `--with` a person.
+- `radar` and declared `--paths` find tasks in progress that touch the same files.
+- `serve` shows the hub in Kanvas's board, with interlock, kind and issue on cards and in the panel; browser edits become issue operations under the same rules.
+- `signalbox-guard` GitHub Actions workflow undoes approvals, acceptances and YOLO by agent accounts or non-approvers.
+- Engine hooks in Kanvas: a pluggable server handler, board names for `.signalbox/` mirrors, and `@login` people.
+
+# Kanvas (upstream)
+
 ## v0.4.0 — 2026-10-27
 Kanvas runs without Obsidian. The board is a JSON file, agents use a new CLI, and you plan and review in an interactive HTML page.
 

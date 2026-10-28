@@ -1,6 +1,26 @@
-# Working on Kanvas
+# Working on Signalbox
 
-Kanvas is a task board shared by humans and AI agents. This file is for agents and contributors changing Kanvas itself. The instructions Kanvas gives to agents in other projects live in `skill/SKILL.md`.
+Signalbox is a fork of Kanvas: the Kanvas engine (`kanvas.py`, `kanvas.html`) plus `signalbox.py`, which moves the board onto GitHub Issues, guards claims with git-ref interlocks and worktrees, and adds Wayfinder maps. This file is for agents and contributors changing this repository. The instructions Signalbox gives to agents in other projects live in `skill/signalbox/SKILL.md` (and Kanvas's own in `skill/SKILL.md`). Read [DESIGN.md](DESIGN.md) before changing how locks, the hub mapping or the browser saves work.
+
+## Signalbox layout
+
+| Path | What it is |
+|------|------------|
+| `signalbox.py` | Trackers (GitHub REST, file), the issue<->task mapping, interlocks, worktrees, policies, maps, the CLI and the server subclass. Python 3.8+, standard library only |
+| `skill/signalbox/SKILL.md` | Agent skill that `signalbox init` installs into projects |
+| `templates/signalbox-guard.yml` | The GitHub Actions workflow `init` installs to undo human-only decisions made by the wrong account |
+| `scripts/demo.py` | Builds a local multi-person, multi-agent demo world (bare remote, two clones, file hub) |
+| `tests/test_signalbox.py` | Signalbox tests: real git repos, racing clones, a fake GitHub API |
+| `DESIGN.md` | Decisions, guarantees and limits |
+
+## Signalbox rules
+
+- **Keep the engine mergeable.** Prefer changing `signalbox.py` over `kanvas.py`/`kanvas.html`; when the engine must change, keep it a small hook that plain Kanvas boards do not notice, so upstream changes still merge (`git fetch upstream && git merge upstream/main`).
+- **The ref is the authority.** Every claim goes through `Interlock.acquire`/`replace`/`release` (compare-and-swap); the issue only mirrors it. Never decide ownership from labels or assignees.
+- **One rulebook.** CLI commands, browser saves (`Hub.apply_board`) and the guard go through the same `Hub` methods and checks.
+- **People are `@login`, agents are bare names.** `is_human()` in both engine files recognises both `human` and `@...`.
+
+# Working on the Kanvas engine
 
 ## Layout
 
