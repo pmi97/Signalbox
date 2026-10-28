@@ -138,6 +138,9 @@ class Pieces(unittest.TestCase):
         self.assertEqual(desc, "Do it\n\nwell")
         self.assertEqual(meta, {"deps": [3, 1], "paths": ["a/-->b"]})
         self.assertEqual(S.split_body("plain"), ("plain", {}))
+        # Text appended after the block (a bot's footer, a person's edit) stays in the description.
+        desc, meta = S.split_body(body + "\n\n---\n_footer_")
+        self.assertEqual((desc, meta["deps"]), ("Do it\n\nwell\n\n---\n_footer_", [3, 1]))
 
     def test_notes_carry_their_author(self):
         agent = S.Actor("claude-code", False, "alice")
@@ -181,6 +184,24 @@ class Interlocks(World):
         self.assertEqual(lock.get(5)[1]["beat"], 1)
         lock.release(5, new)
         self.assertEqual(lock.get(5), (None, None))
+        # The ref is append-only: released means a "free" record on top, and the next claim builds on it.
+        again = lock.acquire(5, {"task": "SB-5", "holder": "b"})
+        self.assertEqual(lock.get(5)[1]["holder"], "b")
+        self.assertEqual(sh("git", "rev-list", "--count", again, cwd=self.alice), "4")  # claim, renew, free, claim
+
+    def test_remote_locks_never_delete_or_force(self):
+        # A remote that refuses deletions and non-fast-forward updates, as protected branches and some proxies do.
+        sh("git", "config", "receive.denyDeletes", "true", cwd=self.remote)
+        sh("git", "config", "receive.denyNonFastForwards", "true", cwd=self.remote)
+        lock = S.Interlock(S.Project(self.alice), "origin")
+        sha = lock.acquire(7, {"task": "SB-7", "holder": "a"})
+        sha = lock.replace(7, sha, {"task": "SB-7", "holder": "a", "beat": 1})
+        lock.release(7, sha)
+        theirs = S.Interlock(S.Project(self.bob), "origin")
+        self.assertEqual(theirs.get(7), (None, None))
+        theirs.acquire(7, {"task": "SB-7", "holder": "b"})
+        with self.assertRaises(S.Locked):
+            lock.acquire(7, {"task": "SB-7", "holder": "a"})
 
     def test_exactly_one_of_two_machines_wins_a_race(self):
         for round_ in range(4):

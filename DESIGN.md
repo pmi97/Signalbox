@@ -36,11 +36,11 @@ People are written `@login` and agents by tool name, so the Kanvas page (patched
 
 Issue assignees are not a lock: two clients can assign themselves at the same moment and both succeed. Signalbox needs a primitive that is **atomic, shared by every machine, and available wherever the code is**. Git already has one: a push with `--force-with-lease=<ref>:<expected>` updates a ref only if it still has the expected value, and an empty expected value means "only if it does not exist". So:
 
-- **claim**: create `refs/signalbox/locks/<n>` pointing at a commit whose message is the lock record. Exactly one racing push wins; the loser reads the winner's record and says who holds it (exit code 3).
-- **heartbeat / take over**: replace the ref, expecting the sha you read.
-- **release**: delete it, expecting the sha you hold.
+- **claim**: create `refs/signalbox/locks/<n>`, or move it on from a "free" record, to a commit whose message is the lock record. Exactly one racing push wins; the loser reads the winner's record and says who holds it (exit code 3).
+- **heartbeat / take over**: add a commit with the new record on top, expecting the sha you read.
+- **release**: add a "free" record on top, expecting the sha you hold.
 
-The lock record lives in an empty-tree commit, so locks cost a few bytes and never touch a branch. Without a remote, the same operations use `git update-ref <ref> <new> <old>` on the repository's own refs, which all its worktrees share, so agents on one machine are still serialized. `tests/test_signalbox.py` races two clones through a real remote repeatedly and requires exactly one winner each time.
+The ref is **append-only**: every move is a fast-forward and nothing is ever deleted or force-pushed. The first version deleted refs on release; the trial on a real GitHub repository went through a git proxy that, like many protected-branch setups, refuses deletions and force-pushes, so release could not work there. Lock records live in empty-tree commits, so a chain costs a few bytes per move. Remotes that accept nothing but branches (that proxy again) take `"locks": {"namespace": "refs/heads/sb-lock"}`: the locks then show as `sb-lock/<n>` branches, and an error names this option when a push to `refs/signalbox/*` is refused. Without a remote, the same operations use `git update-ref <ref> <new> <old>` on the repository's own refs, which all its worktrees share, so agents on one machine are still serialized. `tests/test_signalbox.py` races two clones through a real remote repeatedly and requires exactly one winner each time.
 
 **Leases** answer crashed agents: a record carries `expires`, `heartbeat` pushes it forward, and once it has passed anyone may `claim --take-over` (a compare-and-swap from the stale sha, so two rescuers cannot both win). A *live* lock can only be broken by a person at a terminal (`unlock`), and the break is written on the issue.
 
@@ -85,5 +85,6 @@ A map is an issue of kind `map` with Wayfinder's five sections, and appears as a
 
 - Writes to one issue body (dependencies, map sections) are read-modify-write and can lose a concurrent edit of the same body. Interlocks protect *claims*, not every field. Moves on a task in progress go through its single holder, which keeps this rare.
 - The GitHub tracker lists all `signalbox` issues and re-reads comments only for issues whose `updated_at` changed (cached in `.signalbox/cache.json`). Very large hubs (thousands of open tasks) will want webhooks or GraphQL instead of polling.
-- Pushing `refs/signalbox/*` requires write access to the repository. Branch-protection rules usually match `refs/heads/*` and leave these alone.
+- Pushing `refs/signalbox/*` requires write access to the repository. Branch-protection rules usually match `refs/heads/*` and leave these alone. Where only branches are accepted, `sb-lock/<n>` branches stay after their tasks are done (released, holding a "free" record); delete them by hand if the remote allows it.
+- GitHub's issue listing lags a few seconds behind writes. Within one command Signalbox overlays the issues it just wrote; across separate commands a just-changed label can read stale for those seconds.
 - `serve` serves one project per process (Kanvas's multi-board server is kept for plain Kanvas boards).

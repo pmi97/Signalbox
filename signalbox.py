@@ -38,6 +38,7 @@ from urllib.parse import quote
 if __package__:  # installed: the Kanvas engine is the kanvas_board package beside this one
     import kanvas_board as K
 else:  # run as a script, or as a project's agent copy: kanvas.py sits next to this file
+    sys.dont_write_bytecode = True  # no __pycache__ in the project's .agents/skills/signalbox/
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import kanvas as K
 
@@ -69,7 +70,8 @@ DECISION_KINDS = ("research", "prototype", "grilling", "task")
 HITL_KINDS = ("grilling", "prototype")
 
 MAP_SECTIONS = ("Destination", "Notes", "Decisions so far", "Not yet specified", "Out of scope")
-META_RE = re.compile(r"\s*<!-- signalbox:meta (\{.*?\}) -->\s*\Z", re.S)
+# The meta block is usually last, but people and bots append to issue bodies, so it is found anywhere.
+META_RE = re.compile(r"[ \t]*<!-- signalbox:meta (\{.*?\}) -->[ \t]*", re.S)
 NOTE_RE = re.compile(r"\A<!-- signalbox:note (\{.*?\}) -->\n?", re.S)
 REF_RE = re.compile(r"^\s*(?:[A-Za-z][A-Za-z0-9]*-|#)?(\d+)\s*$")
 
@@ -161,14 +163,16 @@ def dumps_meta(meta):
 def split_body(body):
     """(description, meta) of an issue body."""
     body = (body or "").replace("\r\n", "\n")
-    m = META_RE.search(body)
-    if not m:
+    found = list(META_RE.finditer(body))
+    if not found:
         return body.strip(), {}
+    m = found[-1]
     try:
         meta = json.loads(m.group(1))
     except ValueError:
         meta = {}
-    return body[:m.start()].strip(), meta if isinstance(meta, dict) else {}
+    desc = re.sub(r"\n{3,}", "\n\n", (body[:m.start()].rstrip() + "\n\n" + body[m.end():].lstrip()).strip())
+    return desc, meta if isinstance(meta, dict) else {}
 
 
 def join_body(desc, meta):
@@ -698,21 +702,24 @@ def make_tracker(project, config):
 # ---------------------------------------------------------------------------
 #
 # A task's lock is a ref, refs/signalbox/locks/<issue number>, pointing at a commit whose message is the lock record
-# (who holds it, for whom, where, until when). Creating, renewing and releasing it are compare-and-swap operations:
-# `git push --force-with-lease=<ref>:<expected>` on the shared remote, or `git update-ref <ref> <new> <old>` when the
-# repository has no remote. Exactly one of two racing claims wins, on any git host, with no server of our own. Every
-# worktree of a repository shares its refs, so agents on one machine contend on the same locks too.
+# (who holds it, for whom, where, until when). The ref is append-only: claiming, renewing and releasing each add a
+# commit on top of the current one (releasing adds a "free" record), and each push names the commit it expects to
+# replace (`git push --force-with-lease=<ref>:<expected>`), so of two racing claims exactly one wins. Nothing is ever
+# deleted or force-pushed, which keeps interlocks working on remotes and proxies that forbid both, as protected
+# branches often do. Without a remote, `git update-ref <ref> <new> <old>` does the same on the repository's own refs,
+# which every worktree of the repository shares, so agents on one machine contend on the same locks too.
 
 ZERO = "0" * 40
 SEEN = "refs/signalbox/seen"
 GIT_ID = {"GIT_AUTHOR_NAME": "signalbox", "GIT_AUTHOR_EMAIL": "signalbox@localhost",
           "GIT_COMMITTER_NAME": "signalbox", "GIT_COMMITTER_EMAIL": "signalbox@localhost"}
+BRANCH_LOCKS = "refs/heads/sb-lock"  # for remotes that accept nothing but branches
 
 
 class Interlock:
     def __init__(self, project, remote, namespace="refs/signalbox/locks"):
         self.cwd, self.remote, self.ns = project.root, remote, namespace.rstrip("/")
-        self._table = None
+        self._raw = None
 
     def where(self):
         return f"remote '{self.remote}'" if self.remote else "this repository only"
@@ -720,11 +727,12 @@ class Interlock:
     def ref(self, n):
         return f"{self.ns}/{n}"
 
-    def _commit(self, record):
+    def _commit(self, record, parent=None):
         tree = git("mktree", cwd=self.cwd, input="")
-        msg = f"signalbox lock {record.get('task', '')}\n\n{json.dumps(record, sort_keys=True, indent=1)}\n"
-        out = run(["git", "commit-tree", tree, "-F", "-"], cwd=self.cwd, input=msg, env={**os.environ, **GIT_ID})
-        return out.strip()
+        title = f"signalbox {'free' if record.get('free') else 'lock'} {record.get('task', '')}"
+        msg = f"{title}\n\n{json.dumps(record, sort_keys=True, indent=1)}\n"
+        args = ["git", "commit-tree", tree] + (["-p", parent] if parent else []) + ["-F", "-"]
+        return run(args, cwd=self.cwd, input=msg, env={**os.environ, **GIT_ID}).strip()
 
     @staticmethod
     def _record(message):
@@ -746,63 +754,77 @@ class Interlock:
                 table[int(tail)] = (sha, self._record(message))
         return table
 
-    def table(self, refresh=False):
-        """{issue number: (sha, record)} of every lock held now."""
-        if self._table is not None and not refresh:
-            return self._table
+    def raw(self, refresh=False):
+        """{issue number: (sha, record)} of every lock ref, free ones included."""
+        if self._raw is not None and not refresh:
+            return self._raw
         if self.remote:
             p = git("fetch", "--quiet", "--no-tags", "--prune", self.remote, f"+{self.ns}/*:{SEEN}/*", cwd=self.cwd, check=False)
             if p.returncode != 0:
                 raise SignalboxError(f"Cannot read the locks on {self.where()}: {p.stderr.strip()}")
-            self._table = self._local_table(SEEN)
+            self._raw = self._local_table(SEEN)
         else:
-            self._table = self._local_table(self.ns)
-        return self._table
+            self._raw = self._local_table(self.ns)
+        return self._raw
+
+    def table(self, refresh=False):
+        """{issue number: (sha, record)} of every lock held now."""
+        return {n: v for n, v in self.raw(refresh).items() if not v[1].get("free")}
 
     def get(self, n, refresh=True):
         return self.table(refresh).get(n, (None, None))
 
     def _cas(self, n, new, old):
-        """Point the lock ref of `n` at `new` (None deletes) if it is still `old` (None: must not exist)."""
+        """Point the lock ref of `n` at `new` if it is still `old` (None: must not exist yet)."""
         ref = self.ref(n)
         if self.remote:
             lease = f"--force-with-lease={ref}:{old or ''}"
-            spec = f"{new}:{ref}" if new else f":{ref}"
-            p = git("push", "--quiet", "--no-verify", self.remote, lease, spec, cwd=self.cwd, check=False)
+            p = git("push", "--quiet", "--no-verify", self.remote, lease, f"{new}:{ref}", cwd=self.cwd, check=False)
             if p.returncode == 0:
-                if new:
-                    git("update-ref", f"{SEEN}/{n}", new, cwd=self.cwd)
-                else:
-                    git("update-ref", "-d", f"{SEEN}/{n}", cwd=self.cwd, check=False)
-                self._table = None
+                git("update-ref", f"{SEEN}/{n}", new, cwd=self.cwd)
+                self._raw = None
                 return True
             text = (p.stderr or "") + (p.stdout or "")
-            if "stale info" in text or "rejected" in text or "already exists" in text:
+            if "stale info" in text or "rejected" in text or "already exists" in text or "failed to lock" in text:
                 return False
-            raise SignalboxError(f"Cannot change the lock on {self.where()}: {text.strip()}")
-        args = ["update-ref", "-d", ref, old or ZERO] if not new else ["update-ref", ref, new, old or ZERO]
-        ok = git(*args, cwd=self.cwd, check=False).returncode == 0
-        self._table = None
+            hint = ""
+            if not self.ns.startswith("refs/heads/"):
+                hint = (f" If this remote only accepts branches, set \"namespace\": \"{BRANCH_LOCKS}\" under \"locks\" "
+                        f"in {STATE_DIR}/{CONFIG_FILE}.")
+            raise SignalboxError(f"Cannot change the lock on {self.where()}: {text.strip()}{hint}")
+        ok = git("update-ref", ref, new, old or ZERO, cwd=self.cwd, check=False).returncode == 0
+        self._raw = None
         return ok
 
-    def acquire(self, n, record):
-        sha = self._commit(record)
-        if self._cas(n, sha, None):
-            return sha
+    def _winner(self, n, task):
         cur_sha, cur = self.get(n)
-        raise Locked(f"{record.get('task', n)} is already locked by {cur.get('label') or cur.get('holder') or 'someone'}",
-                     cur, cur_sha)
+        holder = (cur or {}).get("label") or (cur or {}).get("holder") or "someone"
+        return Locked(f"{task} is already locked by {holder}", cur, cur_sha)
+
+    def acquire(self, n, record):
+        sha, cur = self.raw(refresh=True).get(n, (None, None))
+        if sha and not cur.get("free"):
+            raise self._winner(n, record.get("task", n))
+        new = self._commit(record, parent=sha)
+        if self._cas(n, new, sha):
+            return new
+        raise self._winner(n, record.get("task", n))
 
     def replace(self, n, old, record):
-        sha = self._commit(record)
-        if self._cas(n, sha, old):
-            return sha
+        known = git("cat-file", "-e", f"{old}^{{commit}}", cwd=self.cwd, check=False).returncode == 0
+        new = self._commit(record, parent=old) if known else None
+        if new and self._cas(n, new, old):
+            return new
         cur_sha, cur = self.get(n)
         raise Locked(f"The lock on {record.get('task', n)} changed meanwhile; it is now held by "
                      f"{(cur or {}).get('label') or 'nobody'}", cur, cur_sha)
 
-    def release(self, n, old):
-        if not self._cas(n, None, old):
+    def release(self, n, old, by=None):
+        record = {"free": True, "task": f"#{n}", "released": iso(now())}
+        if by:
+            record["by"] = by
+        new = self._commit(record, parent=old)
+        if not self._cas(n, new, old):
             cur_sha, cur = self.get(n)
             if cur_sha:
                 raise Locked(f"The lock on #{n} changed meanwhile; it is now held by {cur.get('label')}", cur, cur_sha)
@@ -1142,6 +1164,9 @@ class Hub:
         self.warnings = []
         self._issues = self._labels = None
         self._comments = {}
+        # Issues this process created or fetched. GitHub's issue listing lags a few seconds behind writes, so these
+        # win over a listing that does not have them yet, or has an older copy.
+        self._recent = {}
 
     # -- reading ---------------------------------------------------------------
 
@@ -1149,12 +1174,23 @@ class Hub:
         return f"{self.prefix}-{n}"
 
     def invalidate(self):
-        self._issues = self._labels = None
+        """Forget the issue listing after a write. Labels stay: only lane changes touch them, and those reset them."""
+        self._issues = None
 
     def issues(self):
         if self._issues is None:
-            self._issues = {i["number"]: i for i in self.tracker.list_issues(MARK)}
+            listed = {i["number"]: i for i in self.tracker.list_issues(MARK)}
+            for n, i in self._recent.items():
+                if n not in listed or (listed[n].get("updated_at") or "") < (i.get("updated_at") or ""):
+                    listed[n] = i
+            self._issues = listed
         return self._issues
+
+    def remember(self, issue):
+        self._recent[issue["number"]] = issue
+        if self._issues is not None:
+            self._issues[issue["number"]] = issue
+        return issue
 
     def labels(self):
         if self._labels is None:
@@ -1170,8 +1206,8 @@ class Hub:
                 raise SignalboxError(f"Task {self.tid(n)} not found on {self.tracker.describe()}")
             if MARK not in issue["labels"]:
                 raise SignalboxError(f"#{n} is not a Signalbox task (it has no '{MARK}' label)")
-            self.issues()[n] = issue
-            return issue
+            self.issues()
+            return self.remember(issue)
         issue = self.issues().get(n)
         if not issue:
             raise SignalboxError(f"Task {self.tid(n)} not found on {self.tracker.describe()}")
@@ -1366,13 +1402,14 @@ class Hub:
             if lab in LABEL_STATES and (state in ("done", "rejected") or LABEL_STATES[lab] != state):
                 self.tracker.remove_label(n, lab)
         self.invalidate()
+        self.remember(self.tracker.get_issue(n))
 
     def update_meta(self, issue, fn, desc=None):
         old_desc, meta = split_body(issue["body"])
         fn(meta)
         body = join_body(old_desc if desc is None else desc, meta)
         if body != issue["body"]:
-            issue = self.tracker.update_issue(issue["number"], body=body)
+            issue = self.remember(self.tracker.update_issue(issue["number"], body=body))
             self.invalidate()
         return issue
 
@@ -1438,21 +1475,29 @@ class Hub:
         lane = self.lane(lane) if isinstance(lane, str) or lane is None else lane
         dep_numbers = []
         live = self.issues()
+
+        def known(n):
+            if n not in live:
+                try:
+                    self.issue(n)
+                except SignalboxError:
+                    return None
+            return self.issues().get(n)
         for ref in deps or ():
             d = number_of(ref)
-            if d not in live or self.state_of(live[d]) is None:
+            if not known(d) or self.state_of(known(d)) is None:
                 raise SignalboxError(f"Dependency '{ref}' not found")
             dep_numbers.append(d)
         parent = None
         if map_ref is not None:
             parent = number_of(map_ref)
-            if parent not in live or self.kind_of(live[parent]) != "map":
+            if not known(parent) or self.kind_of(known(parent)) != "map":
                 raise SignalboxError(f"{self.tid(parent)} is not a map; create one with `{command('map new')}`")
         state = state or ("proposed" if not self.actor.human else "todo")
         meta = {"by": self.actor.by, "at": iso(now()), "deps": sorted(set(dep_numbers)), "map": parent,
                 "paths": list(paths or [])}
         labels = [MARK, STATE_LABELS[state]] + ([lane["label"]] if lane else []) + ([KIND_PREFIX + kind] if kind != "build" else [])
-        issue = self.tracker.create_issue(title, join_body(desc, meta), labels)
+        issue = self.remember(self.tracker.create_issue(title, join_body(desc, meta), labels))
         n = issue["number"]
         self._link_deps(n, dep_numbers)
         if parent:
@@ -1663,7 +1708,7 @@ class Hub:
         return rec
 
     def _release(self, n, sha, rec, keep_assignee=False):
-        self.locks.release(n, sha)
+        self.locks.release(n, sha, by=self.actor.by)
         self.tracker.remove_label(n, LOCK_LABEL)
         if not keep_assignee and rec.get("sponsor"):
             try:
@@ -2052,6 +2097,10 @@ class Hub:
                 if t.get("yolo"):
                     self.tracker.add_labels(n, [YOLO_LABEL])
                 continue
+            same_notes = [(x.get("cid"), x.get("text")) for x in t.get("notes", [])] == \
+                [(x.get("cid"), x.get("text")) for x in o.get("notes", [])]
+            if same_notes and all(t.get(f) == o.get(f) for f in ("title", "desc", "deps", "group", "yolo", "state")):
+                continue  # untouched: no need to ask the hub about it
             issue = self.issue(n)
             if t["title"] != o["title"]:
                 self.tracker.update_issue(n, title=t["title"])
@@ -3005,7 +3054,7 @@ class SignalboxHandler(K.BoardHandler):
             old = K.parse_board(current.decode("utf-8"))
             error = None
             hub.invalidate()
-            hub.locks._table = None
+            hub.locks._raw = None
             try:
                 done = hub.apply_board(old, new)
                 if done and not self.server.quiet:
@@ -3041,7 +3090,7 @@ def poll_hub(server, name, hub, lock, every):
         try:
             with lock:
                 hub.invalidate()
-                hub.locks._table = None
+                hub.locks._raw = None
                 hub.write_mirror()
         except Exception as e:  # keep serving through network blips
             if not server.quiet:
@@ -3301,6 +3350,12 @@ def main(argv=None):
     func = getattr(args, "func", cmd_status)
     try:
         return func(args) or 0
+    except BrokenPipeError:  # the reader stopped early, as `| head` does
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+        return 0
     except Locked as e:
         print(f"Locked: {e}", file=sys.stderr)
         return 3

@@ -12,10 +12,6 @@ permissions:
   issues: write
   contents: read
 
-concurrency:
-  group: signalbox-guard-${{ github.event.issue.number }}
-  cancel-in-progress: false
-
 jobs:
   guard:
     if: contains(github.event.issue.labels.*.name, 'signalbox')

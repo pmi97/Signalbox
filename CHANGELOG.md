@@ -12,6 +12,7 @@ The first release of Signalbox, a fork of Kanvas 0.4.0 for teams of people and a
 - `radar` and declared `--paths` find tasks in progress that touch the same files.
 - `serve` shows the hub in Kanvas's board, with interlock, kind and issue on cards and in the panel; browser edits become issue operations under the same rules.
 - `signalbox-guard` GitHub Actions workflow undoes approvals, acceptances and YOLO by agent accounts or non-approvers.
+- Tried on a real GitHub repository: interlocks are append-only fast-forward chains (no deletes, no force-pushes), lock refs can live under `refs/heads/sb-lock` for branch-only remotes, the issue meta block is found anywhere in the body, recent writes win over GitHub's lagging issue listing, browser saves touch only changed tasks, and the agent copy writes no `__pycache__`.
 - Engine hooks in Kanvas: a pluggable server handler, board names for `.signalbox/` mirrors, and `@login` people.
 
 # Kanvas (upstream)

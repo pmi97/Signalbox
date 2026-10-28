@@ -45,7 +45,7 @@ flowchart LR
 ```
 
 - **The hub is GitHub Issues.** A task is an issue labelled `signalbox`. Its state is a label (`sb:proposed`, `sb:todo`, `sb:doing`, `sb:review`), and done means closed. Its lane is a label (`lane:Payments`) and its kind is a label (`kind:research`). Dependencies sit in a small hidden block in the issue body and are mirrored to GitHub's native *blocked by* links. Notes are comments signed with who wrote them, and for whom. Anyone can follow along in GitHub itself, and every group shares the same hub.
-- **The interlock is a git ref.** `claim` creates `refs/signalbox/locks/<issue>` on the shared remote with `git push --force-with-lease=<ref>:` (create only if absent). When two machines race, exactly one push wins. The ref points at a commit holding the lock record: holder, sponsor, host, branch, worktree and lease end. Renewing, taking over and releasing are compare-and-swap too. This needs no server and works on any git host. On a repository without a remote, the same locks live in local refs, which every worktree of the repository shares.
+- **The interlock is a git ref.** `claim` creates `refs/signalbox/locks/<issue>` on the shared remote with `git push --force-with-lease=<ref>:` (create only if absent). When two machines race, exactly one push wins. The ref points at a commit holding the lock record: holder, sponsor, host, branch, worktree and lease end. Renewing, taking over and releasing are compare-and-swap too. This needs no server and works on any git host; every move is a fast-forward, so remotes that forbid deletes and force-pushes work too. On a repository without a remote, the same locks live in local refs, which every worktree of the repository shares.
 - **Each claim gets a worktree.** `../<repo>.worktrees/SB-12` on branch `sb/sb-12-<title>`, `git worktree lock`ed with the holder in its reason. Configured untracked files (such as `.env`) are copied in and a setup command runs. A unique port goes into `SB_PORT`, and a `TASK.md` brief tells the agent what it holds.
 - **Rules are enforced twice.** The CLI refuses moves that are not yours to make: agents can't approve, nobody claims a blocked task, only the holder finishes. Human decisions need a person at a terminal, or the browser board. On GitHub, the `signalbox-guard` workflow undoes approvals, acceptances and YOLO made by agent accounts or non-approvers, using the identities GitHub records.
 
@@ -145,7 +145,7 @@ The map is an issue with Wayfinder's sections: Destination, Notes, Decisions so 
 }
 ```
 
-`agents.logins` names the GitHub accounts your agents use. Give agents their own bot account or GitHub App: then GitHub, and so the guard, can tell an agent from its sponsor. `"paths": "block"` turns overlapping declared paths from a warning into a refusal. `"hub": {"type": "file"}` keeps the hub in a local JSON file, for a single machine, offline work and tests.
+`agents.logins` names the GitHub accounts your agents use. Give agents their own bot account or GitHub App: then GitHub, and so the guard, can tell an agent from its sponsor. Remotes that accept only branches (some proxies and locked-down hosts) take `"locks": {"namespace": "refs/heads/sb-lock"}`; `doctor --probe` tells you whether you need it. `"paths": "block"` turns overlapping declared paths from a warning into a refusal. `"hub": {"type": "file"}` keeps the hub in a local JSON file, for a single machine, offline work and tests.
 
 ## Commands
 
