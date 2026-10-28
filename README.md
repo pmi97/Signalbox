@@ -1,290 +1,163 @@
-<h1>
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="img/kanvas-dark.svg">
-<img src="img/kanvas.svg" alt="Kanvas" height="56">
-</picture>
-</h1>
+# Signalbox
 
-A task board you share with your AI coding agents. Agents plan and report through a small CLI; you approve, steer and review in an interactive board in your browser.
+**The interlocking board for teams of humans and AI agents.**
 
-One JSON file, one Python script, one HTML page. No accounts, no build step, no dependencies.
+In a railway signal box, an *interlocking* makes conflicting routes impossible: two trains can never be signalled onto the same track. Signalbox does the same for work. Many people and many agents share one board on GitHub Issues. Every task anyone works on is held by an **interlock**, an atomic lock kept in git. Each claimed task gets its own **git worktree**. A state machine decides who may move what.
 
-![The dependency graph of a project that trains a drone to fly itself: simulation, training, evaluation and flight tests](img/graph.png)
+![Signalbox: three lanes, a Wayfinder map, interlocks held by an agent and a person, an agent waiting for an answer](img/signalbox-graph.png)
+
+Signalbox is a fork of [Kanvas](https://github.com/XMihura/Kanvas) by Mihura, which gave one person and their agents a shared, visual board. Signalbox scales it to **multiple groups of people and multiple agents at once**, and adds the planning model of Matt Pocock's [`/wayfinder`](https://github.com/mattpocock/skills/tree/main/skills/engineering/wayfinder) skill: maps, destinations, fog of war, a frontier, and decision tickets. Like Kanvas, it is plain Python 3.8+ with the standard library only, one HTML page, and no server of its own.
 
 ## Why
 
-AI agents do their best work in a terminal, but a project needs a plan that outlives a single chat: what is left, what depends on what, what was decided and why. Kanvas keeps that plan in `kanvas.json` next to your code, where you and any number of agents work on it together.
+Agents are now cheap enough that a team runs a dozen at once, next to the people on the team. That breaks the tools in between:
 
-- **You stay in control.** Agents propose tasks and you approve them. Agents finish tasks and you review them. Only you mark work done, unless you hand a chain of tasks over with YOLO, and even then the task at its end comes back to you for review.
-- **Agents cannot break the board.** They change it through `kanvas.py`, which enforces the workflow and rejects invalid moves with a clear message.
-- **Live.** Agent changes appear in the browser within a second, and your edits are on disk immediately for the agent's next command.
-- **Agent-agnostic.** Claude Code, Codex, Cursor, Gemini CLI, OpenCode, GitHub Copilot, or anything that runs shell commands. Use several at once; notes record who did what.
-- **Git-friendly.** The board is plain, stably formatted JSON. Commit it with the code and your history shows how the plan evolved.
-
-## Quick start
-
-### The easy way: let your agent set it up
-
-The easiest way to start is just to open Claude Code, Codex, Cursor, Gemini CLI or OpenCode in your project's folder and paste into the chat:
-
-> Set up Kanvas in this project with `uvx kanvas-board init` (https://github.com/XMihura/Kanvas), then follow `.agents/skills/kanvas/SKILL.md` and plan the work with me on the board.
-
-The agent should then guide you.
-
-### Formal quickstart
-
-Kanvas works on Linux, macOS and Windows. You need a browser and [uv](https://docs.astral.sh/uv/), which installs Kanvas and downloads Python too if your computer has none.
-
-**1. Install uv** (once). On macOS and Linux, run this in a terminal:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-On Windows, run this in PowerShell:
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-Then close the terminal and open a new one.
-
-**2. Install Kanvas** (once):
-
-```bash
-uv tool install kanvas-board
-```
-
-This gives you the `kanvas` command. If the terminal later cannot find it, run `uv tool update-shell` and open a new terminal.
-
-**3. Open the board.** Go to your project's folder and run:
-
-```bash
-cd path/to/your-project
-kanvas init
-kanvas serve
-```
-
-`init` creates the board, `kanvas.json`, and installs the agent skill in `.agents/skills/kanvas/`: instructions for your agents and their own copy of Kanvas, so agents need nothing installed. Commit `kanvas.json` and `.agents/` with your project.
-
-Agents that support skills pick the skill up automatically, and `init` creates an `AGENTS.md` that points the others to it. If your project already has an `AGENTS.md`, `init` leaves it untouched and, when the file does not mention the skill yet, prints this line for you to add:
-
-```
-Plan and track work on the Kanvas board; follow .agents/skills/kanvas/SKILL.md.
-```
-
-`serve` opens the board in your browser. Keep it running while you work; Ctrl+C stops it. Run `kanvas serve` in your other projects too: their boards open in the same Kanvas, each at its own address such as `http://127.0.0.1:8765/my-project/`, and the terminal is free again right away. Switch boards from the menu on the board's name, or with Shift+← and Shift+→, or keep each in a tab of its own.
-
-**4. Ask your agent:**
-
-> Interview me about this project and plan it on the Kanvas board.
-
-The plan arrives as proposals. Approve the ones you want, and tell the agent to start working.
-
-### Other ways to install and update
-
-Try Kanvas without installing it:
-
-```bash
-uvx kanvas-board init
-uvx kanvas-board serve
-```
-
-Install with pipx, or straight from GitHub without PyPI:
-
-```bash
-pipx install kanvas-board
-uv tool install https://github.com/XMihura/Kanvas/archive/refs/heads/main.zip
-```
-
-Without uv, you need Python 3.8 or newer. [Download](https://github.com/XMihura/Kanvas/archive/refs/heads/main.zip) or clone this repository and run its `kanvas.py` in your project's folder; from then on, use the project's copy (type `python3` where `python` is missing):
-
-```bash
-python path/to/kanvas.py init
-python .agents/skills/kanvas/kanvas.py serve
-```
-
-To update, run this, then `kanvas init` again in each project to refresh the copy its agents use:
-
-```bash
-uv tool upgrade kanvas-board
-```
-
-`kanvas status` and `kanvas serve` remind you when a project's copy differs from the installed `kanvas`: they suggest `kanvas init` when the copy is older, and `uv tool upgrade kanvas-board` when it is newer.
+| What you need | Kanvas | Wayfinder | Plain worktrees | **Signalbox** |
+|---|---|---|---|---|
+| A plan that outlives one chat | ✓ local `kanvas.json` | ✓ issue tracker | – | ✓ GitHub Issues, shared by every group |
+| Visual board, live | ✓ | – | – | ✓ (Kanvas's graph and Kanban views) |
+| Agents propose, people approve and review | ✓ | partly | – | ✓ enforced in the CLI **and** on GitHub |
+| Several people with roles | – (one human) | – | – | ✓ lanes with owners, approvers, WIP limits |
+| Two agents can't take the same task | file lock, one machine | assignee, racy | – | ✓ atomic compare-and-swap on a git ref, any machine |
+| A crashed agent doesn't block a task forever | – | – | – | ✓ leases, heartbeats, take-over |
+| Isolated checkout per task | – | – | ✓ | ✓ created, locked, set up and cleaned for you |
+| Know who works where, on which branch | – | – | local only | ✓ on the board, for everyone |
+| Spot two tasks changing the same files | – | – | – | ✓ `radar` and declared paths |
+| Hand work to someone else, another machine | – | – | – | ✓ `handoff` pushes, `claim` resumes |
+| Plan through fog, one decision at a time | – | ✓ maps | – | ✓ maps on the same board, HITL rules enforced |
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    agent["AI agents"] -- "kanvas.py start / finish / propose / note" --> board[("kanvas.json")]
-    you["You"] -- "browser" --> page["kanvas.html"]
-    page <-- "kanvas serve" --> board
+    subgraph people["People (lanes, owners, approvers)"]
+      alice["@alice"] & bob["@bob"]
+    end
+    subgraph agents["Agents (each for a person)"]
+      cc["claude-code"] & cx["codex"]
+    end
+    people -- "serve: the board in the browser" --> sb
+    agents -- "signalbox claim / finish / note" --> sb
+    sb["signalbox.py"] -- "issues, labels, comments" --> gh[("GitHub Issues: the hub")]
+    sb -- "refs/signalbox/locks/N (compare-and-swap)" --> remote[("git remote: interlocks")]
+    sb -- "git worktree add + lock" --> wt["../repo.worktrees/SB-12"]
+    gh -- "issue events" --> guard["signalbox-guard workflow"]
 ```
 
-Every task moves through five states. A to-do task whose dependencies are unfinished shows as blocked, and becomes ready by itself once they are done.
+- **The hub is GitHub Issues.** A task is an issue labelled `signalbox`. Its state is a label (`sb:proposed`, `sb:todo`, `sb:doing`, `sb:review`), and done means closed. Its lane is a label (`lane:Payments`) and its kind is a label (`kind:research`). Dependencies sit in a small hidden block in the issue body and are mirrored to GitHub's native *blocked by* links. Notes are comments signed with who wrote them, and for whom. Anyone can follow along in GitHub itself, and every group shares the same hub.
+- **The interlock is a git ref.** `claim` creates `refs/signalbox/locks/<issue>` on the shared remote with `git push --force-with-lease=<ref>:` (create only if absent). When two machines race, exactly one push wins. The ref points at a commit holding the lock record: holder, sponsor, host, branch, worktree and lease end. Renewing, taking over and releasing are compare-and-swap too. This needs no server and works on any git host; every move is a fast-forward, so remotes that forbid deletes and force-pushes work too. On a repository without a remote, the same locks live in local refs, which every worktree of the repository shares.
+- **Each claim gets a worktree.** `../<repo>.worktrees/SB-12` on branch `sb/sb-12-<title>`, `git worktree lock`ed with the holder in its reason. Configured untracked files (such as `.env`) are copied in and a setup command runs. A unique port goes into `SB_PORT`, and a `TASK.md` brief tells the agent what it holds.
+- **Rules are enforced twice.** The CLI refuses moves that are not yours to make: agents can't approve, nobody claims a blocked task, only the holder finishes. Human decisions need a person at a terminal, or the browser board. On GitHub, the `signalbox-guard` workflow undoes approvals, acceptances and YOLO made by agent accounts or non-approvers, using the identities GitHub records.
 
-| State | Color and mark | Who moves it there |
-|-------|----------------|--------------------|
-| Proposed | purple, dashed circle | An agent proposes it |
-| To do | blue, empty circle (gray and struck through while blocked) | You approve it |
-| Doing | orange, half-filled circle | An agent starts it |
-| Review | pink, three-quarters-filled circle | The agent finishes it, with a summary of what it did |
-| Done | green, filled circle with a check | You accept it, or send it back with feedback |
+## The states, and who moves them
 
-Agents may propose tasks and groups, start ready tasks, finish or pause tasks in progress, add notes and add dependencies. Until you approve a proposal, they may also revise, withdraw or rewire it, so you can reshape a plan together in the conversation and the board follows. **Ask for changes** on a proposal leaves your request as a note: agents see it in `status`, revise the proposal, and their next note answers it. Everything else belongs to you: approving, changing approved tasks, marking done. Feedback you leave when sending a task back becomes a note the agent reads when it picks the task up again.
+| State | Who moves it there | How |
+|-------|--------------------|-----|
+| Proposed | anyone (agents always land here) | `propose`, `batch`, `map new` |
+| To do | an approver of the task's lane | the board, or `approve` in their terminal |
+| Doing | whoever wins the interlock | `claim` (lock + worktree) |
+| Review | the lock holder | `finish -m SUMMARY` (or `resolve` for decision tickets) |
+| Done | an approver of the lane | the board, or `accept`; `send-back` returns it to To do with feedback |
 
-## The board
+Blocked is derived: a To-do task with unfinished dependencies. **YOLO** (from Kanvas) hands a chain to the agents. Everything the YOLO task depends on is done without review, and the YOLO task itself comes back for review.
 
-![Reviewing a finished task](img/review.png)
+## Quick start
 
-- **Graph view.** One swimlane per group, laid out by dependency depth, flowing left to right or top to bottom (switch under Display, or press `L`). The automatic layout orders the cards for fewer crossings and straighter arrows, and arrows that skip levels run between cards. A swimlane with three or more finished tasks folds them into one stub, such as "8 done": click it to show them, and again to fold them. Arrows from folded tasks are left out, since a finished dependency holds nothing up, and a task you open from a link, the bell or search shows even when its swimlane is folded. Set the card order to Manual under Display (or press `M`) to order the cards yourself: drag a card up or down within its level, or into another swimlane to change its group, and drag a swimlane by its name to reorder the groups. Your order is saved in `kanvas.json`, and right-clicking empty space offers to start from the automatic order. The spacing slider under Display, or `[` and `]`, compresses or extends the space between dependency levels. Hover or select a task to highlight everything it depends on and everything waiting for it. A dependency that another dependency already implies (C needs A and B, and B needs A) stays in the file but is drawn only while A or C is selected, as a dashed arrow. Each card has a dot on its incoming and outgoing side: drag one onto another card to add a dependency in that direction (cycles are refused). Click an arrow to open or remove the dependency.
-- **Board view.** Kanban columns by state. Drag cards between columns, or approve every proposal at once. Marking the open task done or sending it back opens the next task in the Review column, within the current filters, so you can go through everything waiting for review one task after another; Undo comes back to it. On a phone, one column fills the screen, and a row above the columns gives every state with its count; tap one to go to its column. On a touch screen, hold a card until it lifts, then drag it to a column or to a state in that row; let go without moving to open its menu.
-- **New tasks.** Choose what a new task depends on and what it blocks by searching, or with **Pick on graph**: click cards to add or remove them, then press Done (or Enter), or Cancel (or Escape) to keep the earlier choice. Choices that would create a cycle are dimmed, with the reason on hover.
-- **Task panel.** Title, Markdown description, state, group, dependencies and the notes timeline. Approve or ask for changes, start, send to review, mark done, or send back with feedback.
-- **Questions from agents.** When an agent needs your answer to go on, it runs `ask` and asks in its chat. Its card turns from Doing to **Waiting for you** and shows the question, a toast announces it, the bell lists it above the work to review, across every open board, and the browser tab's title counts the agents waiting, as in `(1) My project · Kanvas`. You reply in the agent's chat, and the card goes back to Doing with the agent's next note. If that chat is gone, Dismiss in the task panel clears the question.
-- **Right-click menus.** On a card: state actions, a new task that depends on it or blocks it, adding and removing dependencies, copying the ID, deleting. On an arrow (left or right click): the two tasks it connects are highlighted and shown in the menu; click either one to open it, or remove the connection. On empty space: a new task in that group, a new group, or deleting that group (its tasks stay without a group unless you choose to delete them too).
-- **Undo and redo.** Ctrl+Z undoes your last change in the browser, Ctrl+Shift+Z or Ctrl+Y redoes it, and the arrows next to New task do the same. On a Mac, these and the page's other Ctrl shortcuts use ⌘, as the page shows. The toast that confirms a change has an Undo button for that change. Changes agents made in the meantime are kept: an undo only touches what your change touched, and refuses if an agent has changed that since. Inside a text field, Ctrl+Z undoes typing as usual.
-- **YOLO.** "YOLO up to here…" on a card (right-click menu or task panel) hands that task and everything it depends on to the agents: the tasks they finish on the way are done without review. The YOLO task itself comes back to you for review, so a YOLO run ends with one review of the result, and YOLO stops applying once that task is in review. YOLO on a task further along takes over the chain: the YOLO marks inside it go, so only the last task comes back for review. Turning it on approves the chain's current proposals and marks the other tasks waiting for review as done. A proposal an agent links into the chain later waits for your approval; one you link yourself is approved with the link. The task carries a YOLO tag and the tasks it covers a lightning icon; the same menu turns it off.
-- **Everything else.** Filter by state, search (press `/`), hide finished work, groups with their own ID prefixes (from the menu on the board name), light, dark or system theme, keyboard shortcuts (press `?`), arrow keys to move from card to card and Enter to move into its panel (Tab goes round the panel, Escape comes back out), and links: `#TR-02` in the URL opens that task.
-
-![The board view in dark mode](img/board-dark.png)
-
-There are three ways to open it:
-
-| | |
-|---|---|
-| `kanvas serve` | Any browser, live two-way sync. Concurrent changes from agents and the browser merge automatically. |
-| Open `kanvas.html` directly | The project has a copy in `.agents/skills/kanvas/`. In Chrome or Edge, choose your `kanvas.json` and the page reads and writes it in place, with live updates. Other browsers edit a copy in the tab; **Save** downloads it. |
-| `kanvas export` | A single self-contained, read-only HTML snapshot to share or attach to a pull request. |
-
-## On your phone
-
-Kanvas can open your boards on your phone, or on another computer, through [Tailscale](https://tailscale.com), a free private network between your own devices.
-
-1. Install Tailscale on the computer that runs Kanvas and on your phone ([downloads](https://tailscale.com/download)), and sign in to the same account on both.
-2. In the board, choose **Open on your phone…** in the menu on the board's name, then **Open to my phone**.
-3. Scan the QR code with the phone's camera.
-
-`kanvas serve --tailscale` opens Kanvas to your phone from the start and prints the QR code in the terminal. Under the QR code are the board's address by the computer's Tailscale name, such as `http://my-computer.tail1234.ts.net:8765/my-project/`, and by its Tailscale IP, in case the name does not resolve. Your other open boards are there too.
-
-Kanvas listens only on this computer and on its Tailscale address, so your home or café network cannot reach it, and it answers only to this computer's own names. It has no password: anyone on your Tailscale network can open and edit your boards. Opening new boards, and opening Kanvas to phones, stay with the computer.
-
-### If the phone cannot connect
-
-The computer's firewall is probably blocking Kanvas. Kanvas uses port 8765, or the next free one up to 8784; the dialog shows which. Allow those ports from Tailscale's addresses (`100.64.0.0/10`) only:
-
-| System | What to do |
-|--------|------------|
-| Windows | The first time, Windows asks whether Python may communicate on networks: allow it. If you missed that, run in PowerShell as administrator: `New-NetFirewallRule -DisplayName "Kanvas over Tailscale" -Direction Inbound -Protocol TCP -LocalPort 8765-8784 -RemoteAddress 100.64.0.0/10 -Action Allow` |
-| macOS | The firewall is off unless you turned it on. If it is on, macOS asks whether Python may accept incoming connections: choose Allow. If you missed that, add Python under System Settings > Network > Firewall > Options. |
-| Ubuntu, Debian, Mint (ufw) | `sudo ufw allow in on tailscale0 to any port 8765:8784 proto tcp` |
-| Fedora, RHEL (firewalld) | `sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="100.64.0.0/10" port port="8765-8784" protocol="tcp" accept'`, then `sudo firewall-cmd --reload` |
-| NixOS | In your configuration: `networking.firewall.interfaces.tailscale0.allowedTCPPortRanges = [ { from = 8765; to = 8784; } ];`, then rebuild |
-
-Then pick **Open on your phone…** again and scan.
-
-### Keep Kanvas running
-
-For the phone to reach your boards, Kanvas has to be running on the computer. Instead of leaving a terminal open, let it start when you log in:
+You need git, Python 3.8+ and, for a GitHub hub, a token (`gh auth login`, or `GH_TOKEN`).
 
 ```bash
-kanvas service install --tailscale
+cd your-repo                       # origin on GitHub
+python path/to/signalbox.py init   # config, agent skill, guard workflow, labels
+git add .signalbox/config.json .agents .claude AGENTS.md .github && git commit -m "Set up Signalbox" && git push
+python .agents/skills/signalbox/signalbox.py serve
 ```
 
-It then runs in the background with the boards you opened before, and opens them to your phone as soon as Tailscale is connected. A board you open later with `kanvas serve` joins it and is remembered too. Leave out `--tailscale` to keep the boards on this computer only. `kanvas service status` says whether it is set up and running, and `kanvas service uninstall` removes it.
+`init` writes `.signalbox/config.json` and installs the agent skill and its own copy of Signalbox in `.agents/skills/signalbox/`, so agents and teammates need nothing installed. It also copies the skill to `.claude/skills/signalbox/` for Claude Code, adds `AGENTS.md` if you have none, adds `.github/workflows/signalbox-guard.yml`, and creates the labels on the hub. It never overwrites your files. With `uv tool install` or `pipx install` on this repository, you get the `signalbox` command (and `sbx`).
 
-This needs Kanvas installed with `uv tool install kanvas-board`, as in [Quick start](#quick-start), so the service has a lasting command to run. On each system it uses the usual mechanism for your own programs, without administrator rights:
+Then ask your agent:
 
-| System | What `service install` sets up |
-|--------|------------|
-| Linux | A systemd user service, `~/.config/systemd/user/kanvas.service`; `systemctl --user status kanvas` and `journalctl --user -u kanvas` show how it is doing. It starts when you log in; to start it at boot, before you log in, run `loginctl enable-linger $USER` once. On NixOS, the same command works. |
-| macOS | A LaunchAgent, `~/Library/LaunchAgents/kanvas.plist`, logging to `~/Library/Logs/Kanvas.log` |
-| Windows | A Task Scheduler task named `kanvas` that runs at logon without a window |
+> Interview me about this project and plan it on the Signalbox board.
 
-The browser's **Open to my phone** and **Stop opening to phones** are remembered the same way, so you can also change phone access from the board.
+### Try it without GitHub
 
-## CLI
+```bash
+python scripts/demo.py /tmp/signalbox-demo
+cd /tmp/signalbox-demo/alice && SIGNALBOX_USER=alice python /path/to/signalbox.py serve
+```
 
-You type `kanvas <command>`; `kanvas -h` lists the commands and `kanvas <command> -h` explains one. Agents run the same commands through the project's copy, `python .agents/skills/kanvas/kanvas.py <command>`, so cloud agents and teammates who never installed Kanvas can work on the board too. Messages name the command you typed: `kanvas ...` for the installed command, `python .agents/skills/kanvas/kanvas.py ...` for the project's copy.
+The demo builds a shared remote, two people's clones and a file hub that stands in for GitHub Issues. Two agents race for a task, one asks a question, one finishes for review, a person takes a task, and a Wayfinder map has resolved research and fog left. The screenshots here are that demo.
 
-| Command | Purpose |
-|---------|---------|
-| `status` | Overview: doing, waiting for review, ready, blocked, proposed, problems |
-| `ready` / `blocked` | What can start now / what waits on what |
-| `show ID` | Details, dependencies and notes |
-| `list [STATE or GROUP]` | Tasks by group, optionally filtered |
-| `start ID [-m NOTE]` | To do to doing |
-| `finish ID -m SUMMARY` | Doing to review, or to done for tasks a YOLO task depends on; the summary is required and kept as a note |
-| `pause ID [-m NOTE]` | Doing back to to do |
-| `note ID TEXT` | Append a note; descriptions stay as the human wrote them |
-| `ask ID QUESTION` | Show that the agent waits for your reply in its conversation, until its next note |
-| `propose GROUP TITLE [DESC] [--deps ID ...]` | Propose a task |
-| `add-group NAME [--prefix XX]` | Create a group |
-| `batch` | Propose many groups and tasks from JSON on stdin |
-| `depend ID ON [ON ...]` | Add dependencies |
-| `edit ID [--title T] [--group G] [--desc D]` | Revise a proposal that is not approved yet |
-| `withdraw ID [ID ...]` | Delete proposals that are not approved yet |
-| `undepend ID ON [ON ...]` | Remove dependencies from a proposal |
-| `check` | Validate the board; exit code 1 on errors |
-| `serve [--port N] [--host H] [--tailscale]` | Open the board in the browser; when Kanvas already runs for another project, open the board there and return. In a project without a board, offer to create one first. `--tailscale` also opens the boards to your phone over Tailscale |
-| `serve --saved` | Serve only the boards open last time, without a project of its own; what `service` runs |
-| `service install [--tailscale]` / `uninstall` / `status` | Start Kanvas when you log in, so your boards are always open; `--tailscale` also opens them to your phone |
-| `init [DIR]` | Set up Kanvas in a project, or refresh the agents' copy after an update |
-| `import FILE.canvas` | Migrate a Kanvas 0.x Obsidian board |
-| `export [FILE.html]` | Write a read-only snapshot |
+## For agents
 
-`init` creates `kanvas.json` and installs the agent skill in `.agents/skills/kanvas/` (a copy of `kanvas.py`, `kanvas.html` and `SKILL.md`), and a copy of `SKILL.md` in `.claude/skills/` for Claude Code, which reads skills only from there. Codex, Cursor, Gemini CLI, OpenCode and GitHub Copilot read `.agents/skills/`. When the project has no `AGENTS.md`, it creates one that points agents to the skill. Run without a folder, it picks the folder that already holds a board (the current folder or one above it), else the top folder of the git repository, else the current folder; `kanvas init .` keeps the current folder, for one board per subproject. Apart from the skill files it installs, it never modifies an existing file.
+Agents read `.agents/skills/signalbox/SKILL.md`. The short version:
 
-In a project without a board, `serve` asks whether to create one, then opens it. Without a person at the terminal, it fails with a message naming `kanvas init`.
+```bash
+export SIGNALBOX_AGENT=claude-code          # sign everything; you act for the hub login (your sponsor)
+signalbox status                            # what is happening, who holds what
+signalbox claim SB-12 -m "Plan: ..." --paths "src/api/**"   # Locked: exit code 3 means someone else won
+cd ../repo.worktrees/SB-12                  # work only here; read .signalbox/TASK.md
+signalbox heartbeat SB-12                   # on long work, keep the lease
+signalbox ask SB-12 "24h or 30d sessions?"  # and stop until the person answers
+signalbox finish SB-12 -m "What changed, how I checked, what to look at"   # pushes, review, releases
+signalbox handoff SB-12 --to bob -m "Half done: ..."                       # bob resumes with claim
+```
 
-One Kanvas serves the boards of all your projects. The first `serve` starts it and keeps running; a `serve` in another project finds it, opens its board there and returns. Each board's address is named after its project folder, and `http://127.0.0.1:8765/` lists the open boards. Kanvas remembers that list, and whether it was open to phones, in `boards.json` in your user folder (`~/.local/state/kanvas/` on Linux, `~/Library/Application Support/Kanvas/` on macOS, `%LOCALAPPDATA%\Kanvas\` on Windows), so the next start reopens them. A board whose file is gone is dropped from the list.
+## For people
 
-Text arguments also accept `--stdin` and `--file PATH`, read as UTF-8 on every platform, which is the reliable way to pass multi-line or non-ASCII text from any shell. Notes and proposals are signed with `--as NAME` or the `KANVAS_AGENT` environment variable. The CLI finds `kanvas.json` in the current directory or any parent; `--board PATH` or `KANVAS_BOARD` point elsewhere.
+- **`serve`** opens the board in your browser, acting as your GitHub login. Approve, ask for changes, review, send back, reject, turn YOLO on, and reshape the plan by dragging, all as in Kanvas. Every change becomes issue operations, checked against the same rules. Cards show who holds each interlock, and the panel shows the lease, branch, worktree, issue and declared paths. Starting work happens through `claim`, never by dragging to Doing: dragging a task to Doing is refused with the command to use instead.
+- **Lanes** are teams or areas of work, with owners and an optional WIP limit (`add-lane Payments --owners bob --wip 3`, or `lanes` in the config). Owners and the global `approvers` decide for their lane, and GitHub teams work as `@org/team`.
+- **`unlock ID`** breaks a stuck lock (a person, at a terminal). `claim ID --take-over` takes over a lock whose lease ran out. `gc` releases locks of finished tasks and removes their worktrees and merged branches. `doctor` checks access and invariants.
 
-Writes take a short lock and replace the file atomically, so several agents and the browser can work at the same time without losing changes.
+![The task panel: who holds the interlock, the lease, branch, worktree and declared paths, next to the agent's open question](img/signalbox-panel.png)
 
-## File format
+## Maps: Wayfinder on the board
+
+For an effort too big and too unclear for one session:
+
+```bash
+signalbox map new "Marketplace payouts" --destination "A spec for weekly seller payouts, agreed by finance"
+signalbox propose - "Which provider covers our countries?" --map SB-7 --kind research
+signalbox propose - "Weekly or on demand?" --map SB-7 --kind grilling --deps SB-8
+signalbox fog SB-7 --add "How disputes claw back paid-out money"
+signalbox frontier SB-7                      # open, unblocked, unclaimed tickets
+signalbox resolve SB-8 -m "Stripe Connect: all 14 countries"   # accepted -> joins "Decisions so far"
+signalbox graduate SB-7 disputes "Who pays for a lost dispute?" --kind grilling
+signalbox scope-out SB-11 -m "Tax reporting is its own effort"
+```
+
+The map is an issue with Wayfinder's sections: Destination, Notes, Decisions so far, Not yet specified, and Out of scope. Its tickets are native sub-issues, and on the board each map is a swimlane. Two Wayfinder rules are enforced rather than just advised. **HITL tickets** (`grilling`, `prototype`) can only be claimed by an agent `--with` the person it works with. A **map is an index**: it can't be claimed, only its tickets can.
+
+## Configuration
+
+`.signalbox/config.json` is shared through git. Everything else in `.signalbox/` stays local: the mirror the browser reads, the cache, and the file hub.
 
 ```json
 {
-  "kanvas": 1,
-  "title": "Learning to fly",
-  "groups": [
-    {
-      "id": "TR",
-      "name": "Training"
-    }
-  ],
-  "tasks": [
-    {
-      "id": "TR-02",
-      "title": "Train the first policy",
-      "state": "review",
-      "group": "TR",
-      "deps": ["TR-01", "SM-03"],
-      "desc": "- [x] Passes every gate on most random courses\n- [x] Copes with wind up to 8 m/s",
-      "notes": [
-        {
-          "at": "2026-10-25T08:20:00Z",
-          "by": "codex",
-          "text": "The policy flies the course on its own: 92 of 100 random courses through every gate."
-        }
-      ]
-    }
-  ]
+  "title": "Acme shop",
+  "prefix": "SB",
+  "hub": {"type": "github", "repo": "acme/shop"},
+  "approvers": ["alice"],
+  "lanes": [{"name": "Payments", "prefix": "PY", "owners": ["bob", "@acme/payments"], "wip": 3}],
+  "agents": {"lease_minutes": 120, "max_claims": 2, "hitl_needs_pair": true, "logins": ["acme-agents-bot"]},
+  "locks": {"remote": "auto", "namespace": "refs/signalbox/locks"},
+  "worktrees": {"dir": "../{repo}.worktrees", "base": "", "copy": [".env"], "setup": "npm ci", "port_base": 4100},
+  "paths": "warn"
 }
 ```
 
-States are `proposed`, `todo`, `doing`, `review` and `done`; blocked is computed. `"yolo": true` on a task puts it and everything it depends on under YOLO. `"at"` and `"by"` on a task say when it was created and by whom: the agent that proposed it, or `"human"` for tasks made in the browser. A note edited in the browser gets an `"edited"` time next to its original `"at"`. A new task takes the highest number in its group plus one, so when the last task of a group is deleted or rejected, the next new task gets its ID. The CLI and the browser write the same canonical formatting, so diffs show only real changes. Unknown fields are preserved. See [`examples/drone.json`](examples/drone.json) for a complete board.
+`agents.logins` names the GitHub accounts your agents use. Give agents their own bot account or GitHub App: then GitHub, and so the guard, can tell an agent from its sponsor. Remotes that accept only branches (some proxies and locked-down hosts) take `"locks": {"namespace": "refs/heads/sb-lock"}`; `doctor --probe` tells you whether you need it. `"paths": "block"` turns overlapping declared paths from a warning into a refusal. `"hub": {"type": "file"}` keeps the hub in a local JSON file, for a single machine, offline work and tests.
 
-## Migrating from Kanvas 0.x (Obsidian)
+## Commands
 
-```bash
-kanvas init
-kanvas import Project.canvas
-```
+| | |
+|---|---|
+| Read | `status`, `ready`, `frontier [MAP]`, `blocked`, `list [FILTER]`, `show ID`, `locks`, `worktrees`, `radar`, `whoami`, `check`, `doctor` |
+| Work (agents and people) | `claim`, `heartbeat`, `note`, `ask`, `finish [--pr]`, `resolve`, `pause`, `handoff`, `unlock` (your own lock) |
+| Plan | `propose`, `batch`, `add-lane`, `depend`, `undepend`, `edit`, `withdraw`, `map new/show`, `fog`, `graduate`, `scope-out` |
+| Decide (people) | `approve`, `changes`, `accept`, `send-back`, `reject`, `yolo`, `unlock` (anyone's) |
+| Run | `init`, `serve`, `sync`, `gc`, `export`, `guard` |
 
-Card colors become states, groups come from the canvas groups, arrows become dependencies, and existing task IDs are kept. The `.canvas` file is left untouched. Once you are happy with the result, delete `Project.canvas`, `canvas-tool.py`, `RULES.md`, the Kanvas instructions in `CLAUDE.md` / `AGENTS.md`, and the `.obsidian/plugins/canvas-watcher` plugin.
+`signalbox <command> -h` explains each one. [DESIGN.md](DESIGN.md) covers the design decisions, the guarantees and their limits.
 
 ## Development
 
@@ -292,8 +165,8 @@ Card colors become states, groups come from the canvas groups, arrows become dep
 python -m unittest discover -s tests -v
 ```
 
-The suite is standard library only; one test also runs the browser's serializer under Node.js when it is installed, to check that both sides write identical files. Contributor notes are in [AGENTS.md](AGENTS.md).
+`tests/test_signalbox.py` drives real git repositories: a bare remote and two clones racing for locks, handing work off, and reviewing it. It also checks the GitHub tracker against a fake REST API. Kanvas's own suite still runs against the engine. Contributor notes are in [AGENTS.md](AGENTS.md), and the engine's documentation is in [docs/KANVAS.md](docs/KANVAS.md).
 
-## License
+## Credits and license
 
-MIT
+MIT. Built on [Kanvas](https://github.com/XMihura/Kanvas) by Mihura (MIT), whose board, engine and workflow are the foundation here. The map model follows [Wayfinder](https://github.com/mattpocock/skills) by Matt Pocock.

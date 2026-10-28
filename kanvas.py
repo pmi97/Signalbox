@@ -537,6 +537,11 @@ def add_note(task, text, by):
 QUESTION = "Question:"
 
 
+def is_human(by):
+    """Notes by people are signed "human", or "@login" on a board shared by several people (Signalbox)."""
+    return by == "human" or str(by or "").startswith("@")
+
+
 def open_question(task):
     """The note in which the agent working on `task` asked the human something in its chat, while it waits.
 
@@ -544,7 +549,7 @@ def open_question(task):
     """
     notes = task.get("notes") or []
     last = notes[-1] if task.get("state") == "doing" and notes else None
-    if last and last.get("by") != "human" and str(last.get("text", "")).startswith(QUESTION):
+    if last and not is_human(last.get("by")) and str(last.get("text", "")).startswith(QUESTION):
         return last
     return None
 
@@ -564,7 +569,7 @@ def change_request(task):
     if task.get("state") != "proposed":
         return None
     for note in reversed(task.get("notes") or []):
-        if note.get("by") != "human":
+        if not is_human(note.get("by")):
             return None
         if str(note.get("text", "")).startswith(CHANGES):
             return note
@@ -1831,7 +1836,11 @@ def qr_text(text):
 
 def board_name(path):
     """The name a board goes by in the URL: its project folder's, made safe for a path."""
-    folder = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    folder = os.path.dirname(os.path.abspath(path))
+    # Signalbox keeps its mirror of the hub in .signalbox/; the board goes by the project's name.
+    if os.path.basename(folder) == ".signalbox":
+        folder = os.path.dirname(folder)
+    folder = os.path.basename(folder)
     return re.sub(r"[^\w.-]+", "-", folder).strip("-.") or "board"
 
 
@@ -1879,7 +1888,8 @@ class BoardServer(ThreadingHTTPServer):
         file path, the open boards and whether phones may connect are kept there for the next start."""
         # TCPServer.__init__ calls server_close when the port is busy, before the rest is set up.
         self.phone_listener = None
-        super().__init__(address, BoardHandler)
+        # Subclasses (Signalbox) serve their boards through their own handler.
+        super().__init__(address, getattr(self, "handler_class", None) or BoardHandler)
         self.hosts = hosts
         self.quiet = quiet
         self.remember = remember

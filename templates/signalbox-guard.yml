@@ -1,0 +1,32 @@
+# Signalbox guard: GitHub knows who made each change to an issue, so this workflow turns the board's human-only
+# decisions into rules. When an account that may not decide (an agent's bot account, or someone who is not an
+# approver of the task's lane) approves a proposal, accepts work, sends it back or turns YOLO on, the guard undoes it
+# and says why in a comment. Approvers and agent accounts are set in .signalbox/config.json.
+name: signalbox-guard
+
+on:
+  issues:
+    types: [labeled, closed]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  guard:
+    if: contains(github.event.issue.labels.*.name, 'signalbox')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .signalbox
+            .agents/skills/signalbox
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Undo decisions made by accounts that may not make them
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNALBOX_USER: github-actions
+        run: python .agents/skills/signalbox/signalbox.py guard --event "$GITHUB_EVENT_PATH"

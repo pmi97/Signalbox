@@ -4,3 +4,20 @@ __pycache__/
 *.tmp
 /dist/
 .claude/
+
+# Packaging and local environments
+*.egg-info/
+/build/
+.venv/
+venv/
+.env
+.DS_Store
+
+# Signalbox's local state, if Signalbox is run in this repository: only config.json and .gitignore are shared
+.signalbox/*
+!.signalbox/config.json
+!.signalbox/.gitignore
+
+# Read-only snapshots written by `export`
+kanvas-snapshot.html
+signalbox-snapshot.html
