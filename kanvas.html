@@ -205,6 +205,24 @@ svg#edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-even
 .head-end { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
 .yolo-tag { display: inline-flex; align-items: center; gap: 2px; font-size: 10px; font-weight: 800; letter-spacing: .08em; padding: 2px 6px 2px 4px; border-radius: 4px; color: var(--yolo-ink); background: var(--yolo-fill); background-size: 200% 100%; box-shadow: 0 0 10px color-mix(in srgb, var(--y3) 50%, transparent); animation: yolo-fire 2.4s ease-in-out infinite alternate; }
 .yolo-tag .icon svg { width: 11px; height: 11px; fill: currentColor; }
+.card-head .cid { flex: none; white-space: nowrap; }
+.sb-lock { display: inline-flex; align-items: center; gap: 2px; min-width: 0; flex: 0 1 auto; max-width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 700; padding: 1px 5px 1px 3px; border-radius: 4px; color: #fff; background: #475569; }
+.sb-lock.expired { background: #b45309; }
+.sb-lock .icon svg { width: 10px; height: 10px; }
+.sb-kind { font-size: 9.5px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; padding: 1px 5px; border-radius: 4px; color: #0369a1; background: color-mix(in srgb, #0ea5e9 16%, transparent); }
+.sb-kind.k-grilling, .sb-kind.k-prototype { color: #9d174d; background: color-mix(in srgb, #ec4899 16%, transparent); }
+.sb-kind.k-map { color: #4338ca; background: color-mix(in srgb, #6366f1 18%, transparent); }
+[data-theme="dark"] .sb-kind { color: #7dd3fc; background: color-mix(in srgb, #0ea5e9 24%, transparent); }
+[data-theme="dark"] .sb-kind.k-grilling, [data-theme="dark"] .sb-kind.k-prototype { color: #f9a8d4; background: color-mix(in srgb, #ec4899 24%, transparent); }
+[data-theme="dark"] .sb-kind.k-map { color: #c7d2fe; background: color-mix(in srgb, #6366f1 30%, transparent); }
+[data-theme="dark"] .sb-expired { color: #fbbf24; }
+.sb-sec { gap: 4px; }
+.sb-row { display: flex; gap: 10px; font-size: 13px; line-height: 1.45; min-width: 0; }
+.sb-k { flex: none; width: 82px; color: var(--faint); }
+.sb-v { min-width: 0; overflow-wrap: anywhere; display: flex; flex-wrap: wrap; gap: 4px; align-items: baseline; }
+.sb-v code { font-size: 12px; }
+.sb-expired { color: #b45309; }
+.sb-hint { font-size: 12.5px; color: var(--faint); margin-top: 4px; }
 .yolo-mark { display: inline-flex; color: var(--yolo-mark); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--yolo) 80%, transparent)); }
 .yolo-mark .icon svg { width: 13px; height: 13px; fill: currentColor; }
 .yolo-btn .icon svg, .yolo-go .icon svg { fill: currentColor; }
@@ -1028,6 +1046,11 @@ function serialize(b) {
   return JSON.stringify(canonical(b), null, 2).replace(STR_ARRAY, (_, items) => "[" + items.replace(/,\n\s*/g, ", ") + "]") + "\n";
 }
 
+const isHuman = (by) => by === "human" || String(by || "").startsWith("@");
+// Boards served by Signalbox carry the hub under `signalbox` and each task's issue, kind and interlock under `sb`.
+const hubOf = () => (board && board.signalbox) || null;
+const sbOf = (t) => (t && t.sb) || {};
+
 const indexOf = (b) => new Map(b.tasks.map((t) => [key(t.id), t]));
 const unmetIn = (ix, t) => t.deps.filter((d) => { const x = ix.get(key(d)); return !x || x.state !== "done"; });
 const vstateIn = (ix, t) => (t.state === "todo" && unmetIn(ix, t).length ? "blocked" : t.state);
@@ -1102,7 +1125,7 @@ function approveJoining(b, before) {
 const QUESTION = "Question:";
 function openQuestion(t) {
   const last = t.state === "doing" ? t.notes[t.notes.length - 1] : null;
-  return last && last.by !== "human" && String(last.text || "").startsWith(QUESTION) ? last : null;
+  return last && !isHuman(last.by) && String(last.text || "").startsWith(QUESTION) ? last : null;
 }
 const questionText = (n) => String(n.text || "").slice(QUESTION.length).trim();
 
@@ -1112,7 +1135,7 @@ const CHANGES = "Changes requested:";
 function changeRequest(t) {
   if (t.state !== "proposed") return null;
   for (let i = t.notes.length - 1; i >= 0; i--) {
-    if (t.notes[i].by !== "human") return null;
+    if (!isHuman(t.notes[i].by)) return null;
     if (String(t.notes[i].text || "").startsWith(CHANGES)) return t.notes[i];
   }
   return null;
@@ -2222,7 +2245,7 @@ function announce(moves, withdrawn, where = null, b = board) {
   let events = [
     ...withdrawn.map((t) => ({ id: t.id, title: t.title, verb: "withdrew", state: null, by: null })),
     ...shown.map(([t, old]) => {
-      const last = t.notes[t.notes.length - 1], by = last && t.notes.length > (old ? old.notes.length : 0) ? last.by : !old && t.by !== "human" ? t.by || null : null;
+      const last = t.notes[t.notes.length - 1], by = last && t.notes.length > (old ? old.notes.length : 0) ? last.by : !old && !isHuman(t.by) ? t.by || null : null;
       if (asked(old, t)) return { id: t.id, title: t.title, verb: "asks", state: "ask", by };
       const verb = old && revised(old, t) ? "revised" : !old && t.state === "proposed" ? "proposed" : ACTIVITY[t.state];
       return { id: t.id, title: t.title, verb, state: vstateIn(ix, t), by };
@@ -2687,7 +2710,7 @@ let lastLayout = null;
 // For tuning the layout from the browser console.
 window.kanvasLayoutStats = () => lastLayout && layoutMetrics(lastLayout);
 
-const agentMark = (by) => h("span", { class: "agent", style: `--a:${by === "human" ? "#64748b" : colorFor(by)}` }, by.slice(0, 1));
+const agentMark = (by) => h("span", { class: "agent", style: `--a:${isHuman(by) ? "#64748b" : colorFor(by)}` }, by.replace(/^@/, "").slice(0, 1));
 
 // What a screen reader says for a card: its ID and title, its state, and the agent or the tasks its foot names.
 function cardLabel(t, vs, waits) {
@@ -2718,6 +2741,23 @@ function cardFoot(t) {
   return h("div", { class: "card-foot" }, left, notes ? h("span", { title: `${notes} note${notes > 1 ? "s" : ""}` }, icon("note"), ` ${notes}`) : null);
 }
 
+const KIND_INFO = { research: "AFK research: an agent finds a fact a decision waits on", prototype: "HITL prototype: a rough artifact to react to, with a person",
+  grilling: "HITL grilling: a decision talked through with a person, live", task: "Manual work a decision waits on", map: "Map: the index of a Wayfinder effort" };
+function kindTag(t) {
+  const k = sbOf(t).kind;
+  return k && k !== "build" ? h("span", { class: `sb-kind k-${k}`, title: KIND_INFO[k] || k }, k === "map" ? "MAP" : k) : null;
+}
+const holderShort = (lock) => String(lock.holder || lock.label || "?").replace(/^@/, "");
+function lockTitle(lock) {
+  const left = lock.expires ? (Date.parse(lock.expires) - Date.now()) / 60000 : 0;
+  return compact(`Interlock held by ${lock.label || lock.holder}`, lock.pair ? `with @${lock.pair}` : null, lock.host ? `on ${lock.host}` : null,
+    lock.branch ? `branch ${lock.branch}` : null, lock.expired || left <= 0 ? "lease expired: anyone may take it over" : `lease ${Math.round(left)} min left`).join("\n");
+}
+function lockTag(t) {
+  const lock = sbOf(t).lock;
+  return lock ? h("span", { class: `sb-lock${lock.expired ? " expired" : ""}`, title: lockTitle(lock) }, icon("lock"), holderShort(lock)) : null;
+}
+
 const isYoloTarget = (t) => yoloActive(t) && same(yoloVia(t), t.id);
 
 function yoloTag(t) {
@@ -2735,7 +2775,7 @@ function fillCard(el, t) {
   el.setAttribute("role", "option");
   el.setAttribute("aria-label", cardLabel(t, vs, unmet(t)));
   el.replaceChildren(...compact(
-    h("div", { class: "card-head" }, h("span", { class: "cid" }, t.id), h("span", { class: "head-end" }, yoloTag(t), h("span", { class: "badge" }, asking ? "Waiting for you" : LABEL[vs]))),
+    h("div", { class: "card-head" }, h("span", { class: "cid" }, t.id), h("span", { class: "head-end" }, kindTag(t), lockTag(t), yoloTag(t), h("span", { class: "badge" }, asking ? "Waiting for you" : LABEL[vs]))),
     h("div", { class: "card-title", title: t.title }, t.title),
     cardFoot(t),
     store.readOnly ? null : h("div", { class: "handle in", title: "Drag onto another card: this card will depend on that one" }),
@@ -3704,7 +3744,8 @@ function stateMoves(t) {
     case "proposed": return [{ label: "Approve", icon: "check", run: to("todo"), to: "todo", primary: true },
       ...(changeRequest(t) ? [] : [{ label: "Ask for changes", icon: "edit", run: () => askChanges(t), asks: true }]),
       { label: "Reject", icon: "trash", run: () => removeTask(t), danger: true, asks: true }];
-    case "todo": return [{ label: "Start", icon: "play", run: to("doing"), to: "doing", primary: true }];
+    case "todo": return hubOf() ? [{ label: "Copy claim command", icon: "copy", run: () => copy(`signalbox claim ${t.id}`) }]
+      : [{ label: "Start", icon: "play", run: to("doing"), to: "doing", primary: true }];
     case "doing": return [{ label: "Send to review", icon: "check", run: to("review"), to: "review", primary: true }, { label: "Mark done", icon: "check", run: to("done"), to: "done" }, { label: "Pause", icon: "pause", run: to("todo"), to: "todo" }];
     case "review": return [{ label: "Mark done", icon: "check", run: () => review(t, "done"), to: "done", primary: true }, { label: "Send back", icon: "back", run: () => sendBack(t), to: "todo", asks: true }];
     case "done": return [{ label: "Reopen", icon: "back", run: to("todo"), to: "todo" }];
@@ -3882,6 +3923,7 @@ function fillPanel(panel, t) {
     h("div", { class: "p-body" },
       title,
       nowCard(t, vs, ro, top),
+      sbSection(t),
       desc ? h("section", { class: "p-sec" },
         t.desc || ui.editingDesc ? h("div", { class: "section-head" }, "Description",
           checks.length ? [h("span", { class: "lane-bar", title: `${done} of ${checks.length} checked` }, h("i", { style: `width:${(100 * done) / checks.length}%` })), h("span", { class: "count" }, `${done}/${checks.length}`)] : null,
@@ -3903,6 +3945,31 @@ function fillPanel(panel, t) {
   );
   for (const ta of panel.querySelectorAll("textarea")) autosize(ta);
   for (const a of panel.querySelectorAll("a.tref")) a.addEventListener("click", (e) => { e.preventDefault(); select(a.dataset.ref); });
+}
+
+function sbSection(t) {
+  const sb = sbOf(t);
+  if (!sb.issue) return null;
+  const row = (k, ...v) => h("div", { class: "sb-row" }, h("span", { class: "sb-k" }, k), h("span", { class: "sb-v" }, ...v));
+  const lock = sb.lock, left = lock && lock.expires ? Date.parse(lock.expires) - Date.now() : 0;
+  const mins = (ms) => (Math.abs(ms) >= 3600000 ? `${Math.floor(Math.abs(ms) / 3600000)}h ${Math.round((Math.abs(ms) % 3600000) / 60000)}m` : `${Math.round(Math.abs(ms) / 60000)}m`);
+  const mapId = sb.map ? `${t.id.split("-")[0]}-${sb.map}` : null;
+  return h("section", { class: "p-sec sb-sec" },
+    h("div", { class: "section-head" }, "Interlock"),
+    lock ? row("Held by", h("b", {}, lock.label || lock.holder), lock.pair ? ` with @${lock.pair}` : "", lock.host ? ` on ${lock.host}` : "")
+      : row("Held by", h("span", { class: "faint" }, t.state === "todo" ? "nobody: free to claim" : "nobody")),
+    lock ? row("Lease", left > 0 ? `${mins(left)} left` : h("b", { class: "sb-expired" }, `expired ${mins(left)} ago: anyone may take it over`)) : null,
+    lock && lock.branch ? row("Branch", h("code", {}, lock.branch)) : null,
+    lock && lock.worktree ? row("Worktree", h("code", { title: lock.worktree }, lock.worktree)) : null,
+    row("Issue", sb.url && /^https?:/.test(sb.url) ? h("a", { href: sb.url, target: "_blank", rel: "noopener" }, `#${sb.issue}`, " ", icon("open")) : `#${sb.issue}`),
+    row("Kind", sb.kind || "build", sb.hitl ? " · HITL, worked live with a person" : sb.kind === "research" ? " · AFK" : ""),
+    sb.lane ? row("Lane", sb.lane) : null,
+    mapId ? row("Map", h("a", { class: "tref", href: `#${mapId}`, "data-ref": mapId }, mapId)) : null,
+    sb.destination ? row("Destination", sb.destination) : null,
+    sb.assignees && sb.assignees.length ? row("Assigned", sb.assignees.map((a) => `@${a}`).join(", ")) : null,
+    sb.paths && sb.paths.length ? row("Paths", ...sb.paths.map((p) => h("code", {}, p))) : null,
+    !lock && t.state === "todo" && sb.kind !== "map" ? h("div", { class: "sb-hint" }, "Claim it in a terminal to get its lock and worktree: ",
+      h("button", { class: "say", title: "Copy", onclick: () => copy(`signalbox claim ${t.id}`) }, `signalbox claim ${t.id}`, icon("copy"))) : null);
 }
 
 function editDesc() { ui.editingDesc = true; ui.focusDesc = true; drafts.descBase = get(ui.selected)?.desc ?? null; renderPanel(); }
@@ -3937,12 +4004,12 @@ function nowCard(t, vs, ro, note) {
     : null;
   const editing = note && !ro && isEditingNote(t, note);
   const waits = unmet(t), q = note && note === openQuestion(t) ? note : null, by = q ? q.by || "the agent" : null;
-  const cr = note && note === changeRequest(t) ? note : null, author = t.by && t.by !== "human" ? t.by : "the agent";
+  const cr = note && note === changeRequest(t) ? note : null, author = t.by && !isHuman(t.by) ? t.by : "the agent";
   const dismiss = () => undoable(ops.note(t.id, "Dismissed the question: no reply is coming in the chat."), "Question dismissed");
   const [mark, headline, body] = q ? [icon("ask"), "Waiting for your reply", null] : cr ? [icon("edit"), "Changes requested", null] : {
     proposed: [icon("spark"), "Proposed", h("p", {}, "Approve it to make it available for work, ask for changes, or reject it.")],
     blocked: [icon("lock"), "Blocked", h("p", {}, "Starts when ", list(waits), waits.length > 1 ? " are done." : " is done.")],
-    todo: [icon("play"), "Ready to start", ro ? null : h("p", {}, "Start it yourself, or tell an agent ", h("button", { class: "say", title: "Copy", onclick: () => copy(`work on ${t.id}`) }, `work on ${t.id}`, icon("copy")))],
+    todo: [icon("play"), "Ready to start", ro ? null : h("p", {}, hubOf() ? "Claim it yourself, or tell an agent " : "Start it yourself, or tell an agent ", h("button", { class: "say", title: "Copy", onclick: () => copy(`work on ${t.id}`) }, `work on ${t.id}`, icon("copy")))],
     doing: [h("i", { class: "live" }), "In progress", null],
     review: [icon("check"), "Ready for your review", null],
     done: [icon("check"), "Done", null],
@@ -3993,7 +4060,7 @@ function noteEl(t, n, ro) {
   const by = String(n.by || "?");
   const editing = !ro && isEditingNote(t, n);
   return h("div", { class: "note" },
-    h("div", { class: "avatar", style: `--a:${by === "human" ? "#64748b" : colorFor(by)}`, title: by }, by.slice(0, 1)),
+    h("div", { class: "avatar", style: `--a:${isHuman(by) ? "#64748b" : colorFor(by)}`, title: by }, by.replace(/^@/, "").slice(0, 1)),
     h("div", { class: "note-main" },
       h("div", { class: "note-meta", title: noteTimes(n) }, h("b", {}, by), " · ", ago(n.at), n.edited ? ` · edited ${ago(n.edited)}` : null, ro || editing ? null : noteEditBtn(t, n)),
       editing ? noteEditor(t, n) : h("div", { class: "note-text md", html: markdown(n.text || ""), ondblclick: ro ? null : () => editNote(t, n) })));
@@ -4637,7 +4704,8 @@ const boardHere = () => decodeURIComponent(location.pathname.split("/")[1] || ""
 const boardUrl = (b) => `/${encodeURIComponent(b.name)}/`;
 // A board without a title goes by the name in its address, as on the page that lists the boards. A file opened in
 // the browser has no such name.
-const boardLabel = () => board.title || (store?.kind === "server" ? boardHere() : store?.boardName) || "Kanvas";
+const productName = () => (hubOf() ? "Signalbox" : "Kanvas");
+const boardLabel = () => board.title || (store?.kind === "server" ? boardHere() : store?.boardName) || productName();
 
 async function refreshBoards() {
   if (store?.kind !== "server") return;
@@ -4718,7 +4786,7 @@ function renderInboxButton() {
   const asks = items.filter((x) => x.state === "ask").length, reviews = n - asks;
   // The tab's title counts the agents waiting for a reply, so the tab shows them while the human is elsewhere.
   const name = boardLabel();
-  document.title = `${asks && !store?.readOnly ? `(${asks}) ` : ""}${name === "Kanvas" ? name : `${name} · Kanvas`}`;
+  document.title = `${asks && !store?.readOnly ? `(${asks}) ` : ""}${name === productName() ? name : `${name} · ${productName()}`}`;
   const btn = $("#inbox");
   if (!btn) return;
   btn.hidden = !!store?.readOnly;
