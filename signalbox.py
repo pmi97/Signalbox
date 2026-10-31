@@ -19,9 +19,12 @@ Python 3.8+, standard library only. `python signalbox.py -h` lists the commands.
 import argparse
 import fnmatch
 import getpass
+import hmac
+import http.cookies
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -33,7 +36,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 if __package__:  # installed: the Kanvas engine is the kanvas_board package beside this one
     import kanvas_board as K
@@ -517,6 +520,7 @@ class GitHubTracker:
         self.repo, self.api = repo, api.rstrip("/")
         self._token = token
         self.transport = transport or self._urllib
+        self.sleep = time.sleep
         self._me = None
 
     def describe(self):
@@ -553,9 +557,49 @@ class GitHubTracker:
         except urllib.error.URLError as e:
             raise SignalboxError(f"Cannot reach GitHub ({self.api}): {e.reason}")
 
+    RETRIES = 3          # extra attempts after a rate limit or a server error
+    MAX_WAIT = 60        # seconds; a rate limit that lasts longer fails at once and says until when
+
+    @staticmethod
+    def _header(headers, name):
+        name = name.lower()
+        return next((v for k, v in (headers or {}).items() if k.lower() == name), None)
+
+    def _retry_after(self, method, status, payload, headers, attempt):
+        """Seconds to wait before trying again, or None to give up. Rate limits (429, or 403 saying so) mean GitHub
+        did nothing, so any request is retried; a server error may come after the write happened, so only requests
+        that are safe to repeat are, never a POST that creates something."""
+        msg = (payload or {}).get("message", "") if isinstance(payload, dict) else ""
+        limited = status == 429 or (status == 403 and (self._header(headers, "Retry-After") is not None
+                                                       or self._header(headers, "X-RateLimit-Remaining") == "0"
+                                                       or "rate limit" in msg.lower()))
+        if not (limited or (status in (500, 502, 503, 504) and method != "POST")):
+            return None
+        wait = None
+        try:
+            if self._header(headers, "Retry-After") is not None:
+                wait = float(self._header(headers, "Retry-After"))
+            elif limited and self._header(headers, "X-RateLimit-Remaining") == "0":
+                wait = float(self._header(headers, "X-RateLimit-Reset")) - time.time() + 1
+        except (TypeError, ValueError):
+            wait = None
+        if wait is None:
+            wait = 2 ** attempt
+        if wait > self.MAX_WAIT:
+            until = time.strftime("%H:%M", time.localtime(time.time() + wait))
+            raise SignalboxError(f"GitHub's rate limit refuses more requests until about {until}; try again then")
+        return max(0.0, wait)
+
     def call(self, method, path, body=None, ok=(200, 201, 204)):
         url = path if path.startswith("http") else f"{self.api}{path}"
-        status, payload, headers = self.transport(method, url, body)
+        for attempt in range(self.RETRIES + 1):
+            status, payload, headers = self.transport(method, url, body)
+            if status in ok or attempt == self.RETRIES:
+                break
+            wait = self._retry_after(method, status, payload, headers, attempt)
+            if wait is None:
+                break
+            self.sleep(wait)
         if status not in ok:
             msg = (payload or {}).get("message", "") if isinstance(payload, dict) else ""
             hint = " Set GH_TOKEN, or log in with `gh auth login`." if status in (401, 403) and not self.token() else ""
@@ -785,16 +829,31 @@ class Interlock:
                 self._raw = None
                 return True
             text = (p.stderr or "") + (p.stdout or "")
-            if "stale info" in text or "rejected" in text or "already exists" in text or "failed to lock" in text:
+            if self._lost_race(ref, old, text):
                 return False
-            hint = ""
+            hint = f"\nTaking a lock means pushing to {self.remote}: check that you have write access to it."
             if not self.ns.startswith("refs/heads/"):
-                hint = (f" If this remote only accepts branches, set \"namespace\": \"{BRANCH_LOCKS}\" under \"locks\" "
-                        f"in {STATE_DIR}/{CONFIG_FILE}.")
+                hint += (f" If it only accepts branches, set \"namespace\": \"{BRANCH_LOCKS}\" under \"locks\" "
+                         f"in {STATE_DIR}/{CONFIG_FILE}.")
             raise SignalboxError(f"Cannot change the lock on {self.where()}: {text.strip()}{hint}")
         ok = git("update-ref", ref, new, old or ZERO, cwd=self.cwd, check=False).returncode == 0
         self._raw = None
         return ok
+
+    # What git prints when the ref was not what the lease expected, or another push held it at that moment.
+    RACE_SIGNS = ("stale info", "fetch first", "already exists", "failed to lock", "cannot lock ref",
+                  "failed to update ref", "incorrect old value")
+
+    def _lost_race(self, ref, old, text):
+        """Whether a refused push lost to another writer, rather than being refused outright (a hook, missing rights,
+        a remote that accepts only branches). Losing means the ref no longer is what we expected."""
+        if any(sign in text for sign in self.RACE_SIGNS):
+            return True
+        p = git("ls-remote", self.remote, ref, cwd=self.cwd, check=False)
+        if p.returncode != 0:
+            return False
+        now_at = next((line.split("\t")[0] for line in p.stdout.splitlines() if line.endswith("\t" + ref)), "")
+        return now_at != (old or "")
 
     def _winner(self, n, task):
         cur_sha, cur = self.get(n)
@@ -1213,7 +1272,9 @@ class Hub:
             raise SignalboxError(f"Task {self.tid(n)} not found on {self.tracker.describe()}")
         return issue
 
-    def comments(self, issue):
+    def comments(self, issue, save=True):
+        """The issue's comments, re-read only when the issue changed. `save=False` leaves writing the disk cache to
+        the caller, which reads many issues and writes it once (`_save_disk_cache`)."""
         n = issue["number"]
         cached = self._comments.get(n)
         if cached and cached[0] == issue.get("updated_at"):
@@ -1226,7 +1287,9 @@ class Hub:
             comments = self.tracker.list_comments(n)
             if self.tracker.kind == "github":
                 disk[str(n)] = {"updated_at": issue.get("updated_at"), "comments": comments}
-                self._save_disk_cache(disk)
+                self._disk_dirty = True
+                if save:
+                    self._save_disk_cache()
         self._comments[n] = (issue.get("updated_at"), comments)
         return comments
 
@@ -1238,9 +1301,19 @@ class Hub:
                 self._disk = {}
         return self._disk
 
-    def _save_disk_cache(self, data):
+    def _save_disk_cache(self, keep=None):
+        """Write the comment cache if it changed. `keep`, a set of issue numbers, drops every other entry, so issues
+        that were closed do not stay in the cache for ever."""
+        disk = self._disk_cache()
+        if keep is not None:
+            for key in [k for k in disk if not (k.isdigit() and int(k) in keep)]:
+                del disk[key]
+                self._disk_dirty = True
+        if not getattr(self, "_disk_dirty", False):
+            return
         try:
-            K.write_text_atomic(self.project.state_path("cache.json"), json.dumps(data, ensure_ascii=False))
+            K.write_text_atomic(self.project.state_path("cache.json"), json.dumps(disk, ensure_ascii=False))
+            self._disk_dirty = False
         except OSError:
             pass
 
@@ -1329,7 +1402,7 @@ class Hub:
             parent = meta.get("map")
             group = f"M{n}" if kind == "map" else f"M{parent}" if parent in maps else lane["id"] if lane else None
             deps = [self.tid(d) for d in meta.get("deps", []) if isinstance(d, int) and d in live]
-            notes = [parse_note(c) for c in self.comments(issue)]
+            notes = [parse_note(c) for c in self.comments(issue, save=False)]
             sb = {"issue": n, "url": issue.get("url"), "kind": kind}
             if kind in HITL_KINDS:
                 sb["hitl"] = True
@@ -1356,6 +1429,8 @@ class Hub:
             if YOLO_LABEL in issue["labels"]:
                 task["yolo"] = True
             tasks.append(task)
+        if self.tracker.kind == "github":
+            self._save_disk_cache(keep=set(live))
         hub = {"hub": self.tracker.describe(), "me": self.actor.by, "locks": self.locks.where(), "version": VERSION}
         return {"kanvas": K.FORMAT, "title": self.config.get("title") or self.project.name, "groups": groups,
                 "tasks": tasks, "signalbox": hub}
@@ -1645,7 +1720,8 @@ class Hub:
         took_over = None
         if cur_sha:
             if cur.get("holder") == self.actor.by:
-                sha = self.locks.replace(n, cur_sha, {**cur, "expires": rec["expires"]})
+                cur = {**cur, "expires": rec["expires"]}
+                sha = self.locks.replace(n, cur_sha, cur)
                 return {"issue": issue, "sha": sha, "record": cur, "how": "already yours", "worktree": cur.get("worktree"),
                         "branch": cur.get("branch"), "warnings": self.warnings}
             expired = lease_left(cur) <= 0
@@ -1663,11 +1739,15 @@ class Hub:
             sha = self.locks.replace(n, cur_sha, rec)
         else:
             sha = self.locks.acquire(n, rec)
+        # Everything below mirrors the lock. If any step fails, each finished step is undone, newest first, and the
+        # lock is given back, so the task is neither stuck in doing nor left with a worktree nobody holds.
+        undo = []
         try:
             if plan:
                 self.note(n, plan)
             if worktree:
                 path, branch, how = self.worktrees.create(tid, issue["title"], self.locks.remote)
+                undo.append(lambda: self._drop_worktree(path, branch, how))
                 rec.update(branch=branch, worktree=path)
                 sha = self.locks.replace(n, sha, rec)
                 self.worktrees.lock(path, f"signalbox: {tid} held by {self.actor.label}")
@@ -1676,10 +1756,15 @@ class Hub:
                 self.warnings += self.worktrees.bootstrap(path, env, self.brief(n, rec))
                 info.update(worktree=path, branch=branch, worktree_how=how, port=env["SB_PORT"])
             if task["state"] != "doing":
+                before = task["state"]
                 self.set_state(issue, "doing")
-            self.tracker.add_labels(n, [LOCK_LABEL])
-            if self.actor.login:
+                undo.append(lambda: self.set_state(self.tracker.get_issue(n), before))
+            if LOCK_LABEL not in issue["labels"]:
+                self.tracker.add_labels(n, [LOCK_LABEL])
+                undo.append(lambda: self.tracker.remove_label(n, LOCK_LABEL))
+            if self.actor.login and login_of(self.actor.login) not in issue.get("assignees", []):
                 self.tracker.set_assignees(n, add=[self.actor.login])
+                undo.append(lambda: self.tracker.set_assignees(n, remove=[self.actor.login]))
             if declared and declared != split_body(issue["body"])[1].get("paths", []):
                 self.update_meta(self.issue(n), lambda m: m.__setitem__("paths", declared))
             where = f" in `{rec['branch']}`" if rec.get("branch") else ""
@@ -1689,15 +1774,33 @@ class Hub:
                          ("had run out." if lease_left(took_over) <= 0 else "a person broke.")
             self.note(n, event, "event")
         except Exception:
-            # The claim failed halfway: give the lock back so the task does not stay stuck.
+            for step in reversed(undo):
+                try:
+                    step()
+                except Exception as e:  # keep undoing the rest; doctor reports what is left
+                    self.warnings.append(f"Could not undo part of the failed claim of {tid}: {e}")
             try:
                 self.locks.release(n, sha)
             except SignalboxError:
                 pass
+            self.invalidate()
             raise
         self.invalidate()
         info.update(sha=sha, record=rec, took_over=took_over)
         return info
+
+    def _drop_worktree(self, path, branch, how):
+        """Undo `Worktrees.create` for a claim that failed: remove a worktree made for it, and the branch too when
+        the claim made it. A worktree that was already there stays, unlocked; one with changes is never removed."""
+        if not os.path.isdir(path) or how == "existing":
+            self.worktrees.unlock(path)
+            return
+        if self.worktrees.dirty(path) and how != "new":
+            self.worktrees.unlock(path)
+            return
+        self.worktrees.remove(path, force=True)
+        if how == "new":
+            git("branch", "-D", branch, cwd=self.project.root, check=False)
 
     def heartbeat(self, ref):
         n = number_of(ref)
@@ -3022,7 +3125,51 @@ def cmd_init(args):
 
 
 class SignalboxHandler(K.BoardHandler):
+    """Kanvas's board server, with saves replayed as hub operations and guarded by a key.
+
+    A save acts as the person who ran `serve`, with their authority to approve and accept. Plain Kanvas lets anything
+    on this computer save; here that would let an agent on the same machine approve its own work with one request.
+    So `serve` makes a random key per run and puts it in the link it opens and prints. Opening that link stores the
+    key in an HttpOnly cookie for this board and port, and redirects to the board without it; every save must carry
+    the cookie. Reading the board needs no key: it holds nothing the hub does not already show."""
+
     server_version = "Signalbox/" + VERSION
+
+    def _cookie_name(self):
+        # Cookies ignore ports, so the name carries it: two servers on one computer keep their own keys.
+        return f"signalbox_key_{self.server.server_address[1]}"
+
+    def _has_key(self):
+        want = getattr(self.server.main, "key", None)
+        if not want:
+            return True
+        try:
+            jar = http.cookies.SimpleCookie(self.headers.get("Cookie") or "")
+        except http.cookies.CookieError:
+            return False
+        got = jar.get(self._cookie_name())
+        return got is not None and hmac.compare_digest(got.value.encode(), want.encode())
+
+    def do_GET(self):
+        parts = self._route()
+        query = parse_qs(urlparse(self.path).query)
+        if "key" in query and self._host_allowed() and len(parts) == 2 and parts[1] in ("", "index.html") \
+                and parts[0] in self.server.main.hubs:
+            want = getattr(self.server.main, "key", "") or ""
+            if not hmac.compare_digest(query["key"][0].encode(), want.encode()):
+                return self._error(403, "This link's key is not this server's; open the link `signalbox serve` printed "
+                                        "when it started")
+            board = f"/{quote(parts[0])}/"
+            cookie = f"{self._cookie_name()}={want}; Path={board}; HttpOnly; SameSite=Strict"
+            return self._send(302, headers={"Location": board, "Set-Cookie": cookie})
+        return super().do_GET()
+
+    def do_POST(self):
+        # Kanvas opens boards to phones through a second listener with its own plain handler, whose saves would
+        # write the mirror directly, past the hub's rules and the key. Signalbox boards stay on this computer.
+        if self._route()[1:] == ["api", "phone"]:
+            return self._error(403, "Signalbox boards are not opened to phones; use the board on this computer")
+        return super().do_POST()
 
     def do_PUT(self):
         if not self._host_allowed():
@@ -3031,6 +3178,9 @@ class SignalboxHandler(K.BoardHandler):
         entry = self.server.main.hubs.get(parts[0]) if parts[1:] == ["api", "board"] else None
         if entry is None:
             return self._error(404, "Not found")
+        if not self._has_key():
+            return self._error(403, "Saving needs this server's key: open the link `signalbox serve` printed when it "
+                                    "started (it ends in ?key=…), then make the change again")
         hub, lock = entry
         text = self._read_json()
         if text is None:
@@ -3081,10 +3231,14 @@ class SignalboxServer(K.BoardServer):
 
     def __init__(self, *a, **kw):
         self.hubs = {}
+        self.key = secrets.token_urlsafe(24)
         super().__init__(*a, **kw)
 
 
 def poll_hub(server, name, hub, lock, every):
+    """Refresh the mirror every `every` seconds. A failure is reported once, not every round while it lasts, and
+    the first refresh that works again says so."""
+    failing = None
     while True:
         time.sleep(every)
         try:
@@ -3093,8 +3247,15 @@ def poll_hub(server, name, hub, lock, every):
                 hub.locks._raw = None
                 hub.write_mirror()
         except Exception as e:  # keep serving through network blips
-            if not server.quiet:
-                print(f"[{time.strftime('%H:%M:%S')}] could not refresh {name}: {e}", file=sys.stderr, flush=True)
+            text = str(e)
+            if text != failing and not server.quiet:
+                more = " (said once while it lasts)" if failing is None else ""
+                print(f"[{time.strftime('%H:%M:%S')}] could not refresh {name}: {text}{more}", file=sys.stderr, flush=True)
+            failing = text
+            continue
+        if failing is not None and not server.quiet:
+            print(f"[{time.strftime('%H:%M:%S')}] refreshing {name} works again", flush=True)
+        failing = None
 
 
 def cmd_serve(args):
@@ -3119,13 +3280,14 @@ def cmd_serve(args):
     threading.Thread(target=poll_hub, args=(server, name, hub, lock, max(2, int(args.poll or project.config["poll_seconds"]))),
                      daemon=True).start()
     host, port = server.server_address[:2]
-    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '') else host}:{port}/{quote(name)}/"
+    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '') else host}:{port}/{quote(name)}/?key={server.key}"
     print(f"Signalbox board for {board['title']}: {len(board['tasks'])} tasks from {tracker.describe()}, "
           f"locks on {hub.locks.where()}")
     print(f"You act as {hub.actor.label} in the browser.")
     print(f"Open {url}  (Ctrl+C to stop)")
+    print("Saving from the browser needs the key in this link; keep it to yourself, and away from your agents.")
     if not server.check_host:
-        print("Warning: listening beyond localhost; anyone who can reach this port acts as you on the board.")
+        print("Warning: listening beyond localhost; anyone with this link who can reach this port acts as you on the board.")
     if not args.no_open:
         threading.Timer(0.4, webbrowser.open, (url,)).start()
     try:

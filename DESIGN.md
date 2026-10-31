@@ -36,7 +36,7 @@ People are written `@login` and agents by tool name, so the Kanvas page (patched
 
 Issue assignees are not a lock: two clients can assign themselves at the same moment and both succeed. Signalbox needs a primitive that is **atomic, shared by every machine, and available wherever the code is**. Git already has one: a push with `--force-with-lease=<ref>:<expected>` updates a ref only if it still has the expected value, and an empty expected value means "only if it does not exist". So:
 
-- **claim**: create `refs/signalbox/locks/<n>`, or move it on from a "free" record, to a commit whose message is the lock record. Exactly one racing push wins; the loser reads the winner's record and says who holds it (exit code 3).
+- **claim**: create `refs/signalbox/locks/<n>`, or move it on from a "free" record, to a commit whose message is the lock record. Exactly one racing push wins; the loser reads the winner's record and says who holds it (exit code 3). A push refused for another reason (a hook, missing rights, a remote that takes only branches) is an error that says so, not a lost race: Signalbox counts a refusal as lost only when git reports a stale lease or a held ref, or when the remote ref has moved since it was read.
 - **heartbeat / take over**: add a commit with the new record on top, expecting the sha you read.
 - **release**: add a "free" record on top, expecting the sha you hold.
 
@@ -44,7 +44,7 @@ The ref is **append-only**: every move is a fast-forward and nothing is ever del
 
 **Leases** answer crashed agents: a record carries `expires`, `heartbeat` pushes it forward, and once it has passed anyone may `claim --take-over` (a compare-and-swap from the stale sha, so two rescuers cannot both win). A *live* lock can only be broken by a person at a terminal (`unlock`), and the break is written on the issue.
 
-The issue is the **visible mirror** of the lock (state `doing`, `sb:locked`, assignee, a 🔒 comment), and the ref is the **authority**. `status` and `doctor` report any disagreement: work in doing without a lock, or a lock on a task that is not in doing. `gc` repairs the second.
+The issue is the **visible mirror** of the lock (state `doing`, `sb:locked`, assignee, a 🔒 comment), and the ref is the **authority**. If a claim fails after winning the lock (GitHub goes away halfway), it undoes the steps it finished, newest first: the assignee, the label, the move to doing, and a worktree and branch it made, and then gives the lock back. `status` and `doctor` report any disagreement: work in doing without a lock, or a lock on a task that is not in doing. `gc` repairs the second.
 
 ### Worktrees, and what Signalbox adds to them
 
@@ -63,7 +63,7 @@ The issue is the **visible mirror** of the lock (state `doing`, `sb:locked`, ass
 
 ### Authority: two layers
 
-- **The CLI** refuses moves that are not the actor's: agents cannot approve, accept, send back, reject, turn YOLO on or break live locks. Agents can edit only proposals, never claim blocked tasks, and only the holder can finish. Human decisions also need a person at the terminal (stdin and stdout are TTYs), because an agent running a shell without signing would otherwise pass as its sponsor. In the browser, the server acts as the logged-in person and replays every edit through the same checks.
+- **The CLI** refuses moves that are not the actor's: agents cannot approve, accept, send back, reject, turn YOLO on or break live locks. Agents can edit only proposals, never claim blocked tasks, and only the holder can finish. Human decisions also need a person at the terminal (stdin and stdout are TTYs), because an agent running a shell without signing would otherwise pass as its sponsor. In the browser, the server acts as the logged-in person and replays every edit through the same checks. Because those saves carry a person's authority, the server makes a random key per run and puts it in the link `serve` opens and prints; opening the link sets it as an HttpOnly, SameSite=Strict cookie for that board and port, and every save must carry it. Without the key, an agent on the same computer could approve its own work with one HTTP request to localhost, past the terminal check. Kanvas's "open to phones" listener uses its own plain handler, so `signalbox serve` refuses it.
 - **The guard workflow** runs on GitHub for every labelled or closed `signalbox` issue. GitHub records who made each change, so the guard can undo an approval, acceptance, send-back or YOLO made by an account in `agents.logins` or by someone outside the lane's approvers, with a comment saying why. This catches clients that never run Signalbox at all, such as a script or a click on github.com.
 
 **Limit:** if an agent uses its sponsor's own token, GitHub cannot tell them apart, and the guard can't either. The CLI's checks still apply, but an agent determined to bypass them could call the API directly. Give agents their own bot account or GitHub App for real enforcement.
@@ -84,7 +84,8 @@ A map is an issue of kind `map` with Wayfinder's five sections, and appears as a
 ## Known limits
 
 - Writes to one issue body (dependencies, map sections) are read-modify-write and can lose a concurrent edit of the same body. Interlocks protect *claims*, not every field. Moves on a task in progress go through its single holder, which keeps this rare.
-- The GitHub tracker lists all `signalbox` issues and re-reads comments only for issues whose `updated_at` changed (cached in `.signalbox/cache.json`). Very large hubs (thousands of open tasks) will want webhooks or GraphQL instead of polling.
+- The GitHub tracker lists all `signalbox` issues and re-reads comments only for issues whose `updated_at` changed (cached in `.signalbox/cache.json`, written once per board and holding only open tasks). Rate limits are waited out when GitHub says for how long, up to a minute, and server errors are retried, except for a POST, which may have gone through. Very large hubs (thousands of open tasks) will want webhooks or GraphQL instead of polling.
 - Pushing `refs/signalbox/*` requires write access to the repository. Branch-protection rules usually match `refs/heads/*` and leave these alone. Where only branches are accepted, `sb-lock/<n>` branches stay after their tasks are done (released, holding a "free" record); delete them by hand if the remote allows it.
 - GitHub's issue listing lags a few seconds behind writes. Within one command Signalbox overlays the issues it just wrote; across separate commands a just-changed label can read stale for those seconds.
+- The `serve` key keeps out requests, not people: an agent that runs as the same user can still read a token or a key from disk or from the process list. As with the sponsor's token above, a separate account is the real boundary.
 - `serve` serves one project per process (Kanvas's multi-board server is kept for plain Kanvas boards).

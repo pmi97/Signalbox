@@ -203,6 +203,25 @@ class Interlocks(World):
         with self.assertRaises(S.Locked):
             lock.acquire(7, {"task": "SB-7", "holder": "a"})
 
+    def test_a_refused_push_is_an_error_not_a_lost_race(self):
+        # A remote that accepts only branches, like the git proxy of the GitHub trial: an agent must hear why and how
+        # to fix it, not that someone else holds the task.
+        hook = os.path.join(self.remote, "hooks", "update")
+        with open(hook, "w", newline="\n") as f:
+            f.write('#!/bin/sh\ncase "$1" in refs/heads/*) exit 0;; *) echo "branches only"; exit 1;; esac\n')
+        os.chmod(hook, 0o755)
+        lock = S.Interlock(S.Project(self.alice), "origin")
+        with self.assertRaises(S.SignalboxError) as cm:
+            lock.acquire(8, {"task": "SB-8", "holder": "a"})
+        self.assertNotIsInstance(cm.exception, S.Locked)
+        self.assertIn(S.BRANCH_LOCKS, str(cm.exception))
+        # The branch namespace works there, and still tells a lost claim from a refusal.
+        lock = S.Interlock(S.Project(self.alice), "origin", S.BRANCH_LOCKS)
+        lock.acquire(8, {"task": "SB-8", "holder": "a"})
+        with self.assertRaises(S.Locked) as cm:
+            S.Interlock(S.Project(self.bob), "origin", S.BRANCH_LOCKS).acquire(8, {"task": "SB-8", "holder": "b"})
+        self.assertEqual(cm.exception.record["holder"], "a")
+
     def test_exactly_one_of_two_machines_wins_a_race(self):
         for round_ in range(4):
             n = 100 + round_
@@ -279,6 +298,40 @@ class Lifecycle(World):
         out = self.sb("gc", agent="claude-code")
         self.assertIn("remove worktree", out)
         self.assertFalse(os.path.isdir(wt))
+
+    def test_a_claim_that_fails_halfway_undoes_itself(self):
+        self.plan()
+        hub = self.hub(agent="claude-code")
+        real = hub.note
+
+        def note(n, text, kind="note"):
+            if kind == "event":
+                raise S.SignalboxError("GitHub went away")
+            return real(n, text, kind)
+
+        with mock.patch.object(hub, "note", side_effect=note), self.assertRaisesRegex(S.SignalboxError, "went away"):
+            hub.claim("SB-3")
+        self.assertEqual(hub.locks.get(3, refresh=True), (None, None))
+        issue = self.hub().issue("SB-3")
+        self.assertEqual(self.state("SB-3"), "todo")
+        self.assertNotIn(S.LOCK_LABEL, issue["labels"])
+        self.assertEqual(issue["assignees"], [])
+        self.assertIsNone(hub.worktrees.find("SB-3"))
+        self.assertEqual(sh("git", "branch", "--list", "sb/sb-3-*", cwd=self.alice), "")
+        # Nothing is left in the way: the next claim works.
+        self.sb("claim", "SB-3", agent="claude-code")
+        self.assertEqual(self.state("SB-3"), "doing")
+
+    def test_claiming_again_returns_the_renewed_lease(self):
+        self.plan()
+        hub = self.hub(agent="claude-code")
+        first = hub.claim("SB-3", worktree=False)
+        later = S.now() + S.timedelta(minutes=30)
+        with mock.patch.object(S, "now", return_value=later):
+            again = self.hub(agent="claude-code").claim("SB-3", worktree=False)
+        self.assertEqual(again["how"], "already yours")
+        self.assertGreater(again["record"]["expires"], first["record"]["expires"])
+        self.assertEqual(hub.locks.get(3, refresh=True)[1]["expires"], again["record"]["expires"])
 
     def test_proposals_and_approvals(self):
         out = self.sb("propose", "Platform", "Rate-limit login", "Stop brute force", agent="claude-code")
@@ -485,6 +538,93 @@ class BrowserSaves(World):
         self.assertEqual(K.board_name(hub.mirror_path()), "alice")
 
 
+class CommentCache(World):
+    def test_board_writes_the_cache_once_and_forgets_closed_issues(self):
+        self.plan()
+        hub = self.hub(tty=True)
+        hub.tracker.kind = "github"  # the disk cache is for the GitHub tracker
+        cache = hub.project.state_path("cache.json")
+        real = K.write_text_atomic
+        writes = []
+
+        def counting(path, text):
+            if path == cache:
+                writes.append(json.loads(text))
+            return real(path, text)
+
+        with mock.patch.object(K, "write_text_atomic", side_effect=counting):
+            hub.board()
+            self.assertEqual(len(writes), 1)
+            self.assertEqual(sorted(writes[0]), ["1", "2", "3"])
+            hub.invalidate()
+            hub.board()
+            self.assertEqual(len(writes), 1)  # nothing changed, nothing written
+            hub.reject(["SB-3"], "not needed")
+            hub.invalidate()
+            hub.board()
+        self.assertEqual(sorted(writes[-1]), ["1", "2"])
+
+
+class ServerKey(World):
+    """Browser saves act with the person's authority, so they need the key from the link `serve` opens."""
+
+    def setUp(self):
+        super().setUp()
+        self.sb("propose", "Platform", "Proposal", agent="claude-code")
+        hub = self.hub(tty=True)
+        hub.write_mirror()
+        self.server = S.SignalboxServer(("127.0.0.1", 0), None, K.LOCAL_NAMES, True)
+        self.name = self.server.add_board(hub.mirror_path(), save=False)
+        self.server.hubs[self.name] = (hub, threading.Lock())
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}/{self.name}/"
+
+    def request(self, method, url, body=None, headers=None):
+        import http.client
+        import urllib.parse
+        u = urllib.parse.urlsplit(url)
+        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=30)
+        try:
+            conn.request(method, u.path + (f"?{u.query}" if u.query else ""), body=body, headers=headers or {})
+            res = conn.getresponse()
+            return res.status, dict(res.getheaders()), res.read()
+        finally:
+            conn.close()
+
+    def approve(self, cookie=None):
+        status, headers, data = self.request("GET", self.base + "api/board")
+        board = json.loads(data)
+        next(t for t in board["tasks"] if t["id"] == "SB-1")["state"] = "todo"
+        h = {"Content-Type": "application/json", "If-Match": headers["ETag"]}
+        if cookie:
+            h["Cookie"] = cookie
+        return self.request("PUT", self.base + "api/board", json.dumps(board).encode(), h)
+
+    def test_saves_without_the_key_are_refused(self):
+        status, _, data = self.approve()
+        self.assertEqual(status, 403, data)
+        self.assertIn("key", json.loads(data)["error"])
+        status, _, _ = self.approve(cookie=f"signalbox_key_{self.server.server_address[1]}=guess")
+        self.assertEqual(status, 403)
+        self.assertEqual(self.state("SB-1"), "proposed")
+        status, _, _ = self.request("GET", self.base + "?key=guess")
+        self.assertEqual(status, 403)
+        status, _, _ = self.request("POST", self.base + "api/phone", b"{}", {"Content-Type": "application/json"})
+        self.assertEqual(status, 403)
+
+    def test_the_link_from_serve_lets_the_browser_save(self):
+        status, headers, _ = self.request("GET", self.base + "?key=" + self.server.key)
+        self.assertEqual((status, headers["Location"]), (302, f"/{self.name}/"))
+        cookie = headers["Set-Cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        status, _, data = self.approve(cookie=cookie.split(";")[0])
+        self.assertEqual(status, 200, data)
+        self.assertEqual(self.state("SB-1"), "todo")
+
+
 class Guard(World):
     config = {"approvers": ["alice"], "agents": {"logins": ["acme-bot"]}}
 
@@ -572,6 +712,39 @@ class GitHubTrackerTests(unittest.TestCase):
         blocked = next(b for m, p, b in self.api.calls if p.endswith("/dependencies/blocked_by"))
         self.assertEqual(blocked, {"issue_id": 13})
         self.assertEqual(self.gh.whoami(), "alice")
+
+    def test_rate_limits_and_server_errors_are_retried(self):
+        answers = [(429, {"message": "slow down"}, {"Retry-After": "2"}), (502, None, {}), (200, [], {})]
+        calls, waits = [], []
+        gh = S.GitHubTracker("o/r", token="t", transport=lambda m, u, b=None: (calls.append(m), answers.pop(0))[1])
+        gh.sleep = waits.append
+        self.assertEqual(gh.list_comments(1), [])
+        self.assertEqual((len(calls), waits), (3, [2.0, 2]))
+
+    def test_creating_is_not_repeated_after_a_server_error(self):
+        calls = []
+        gh = S.GitHubTracker("o/r", token="t", transport=lambda m, u, b=None: (calls.append(m), (502, None, {}))[1])
+        gh.sleep = lambda s: None
+        with self.assertRaisesRegex(S.SignalboxError, "502"):
+            gh.create_issue("T")
+        self.assertEqual(calls, ["POST"])
+
+    def test_a_long_rate_limit_says_until_when(self):
+        import time as _time
+        reset = str(int(_time.time()) + 3600)
+        gh = S.GitHubTracker("o/r", token="t", transport=lambda m, u, b=None: (
+            403, {"message": "API rate limit exceeded"}, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset}))
+        gh.sleep = lambda s: self.fail("should not wait an hour")
+        with self.assertRaisesRegex(S.SignalboxError, "rate limit refuses more requests until"):
+            gh.list_comments(1)
+
+    def test_permission_refusals_are_not_retried(self):
+        calls = []
+        gh = S.GitHubTracker("o/r", token="t", transport=lambda m, u, b=None: (
+            calls.append(m), (403, {"message": "Resource not accessible"}, {"X-RateLimit-Remaining": "4999"}))[1])
+        with self.assertRaisesRegex(S.SignalboxError, "403 Resource not accessible"):
+            gh.list_comments(1)
+        self.assertEqual(len(calls), 1)
 
     def test_refusals_explain_themselves(self):
         gh = S.GitHubTracker("o/r", token="", transport=lambda m, u, b=None: (401, {"message": "Bad credentials"}, {}))

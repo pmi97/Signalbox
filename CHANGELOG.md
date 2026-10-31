@@ -1,5 +1,14 @@
 # Changelog
 
+## Signalbox, unreleased
+
+- `serve` guards saves with a key: the link it opens and prints carries one per run, the page keeps it in an HttpOnly cookie, and saves without it are refused, so an agent on the same computer cannot approve its own work through the board's API. Opening the board to phones is refused, since that listener would bypass the hub.
+- A lock push the remote refuses (a hook, missing rights, a branch-only remote) is reported as an error with the fix, no longer as "already locked by someone".
+- A claim that fails halfway undoes what it did (assignee, `sb:locked`, the move to doing, a new worktree and branch) before giving the lock back. Claiming a task you hold returns the renewed lease.
+- GitHub rate limits and server errors are retried with backoff (`Retry-After`, `X-RateLimit-Reset`); a POST is not repeated after a server error, and a limit longer than a minute fails at once and says until when.
+- The comment cache is written once per board build, not once per issue, and drops closed tasks.
+- `serve` reports a failing refresh once while it lasts, and says when it works again.
+
 ## Signalbox 0.1.0
 
 The first release of Signalbox, a fork of Kanvas 0.4.0 for teams of people and agents.
