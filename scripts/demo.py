@@ -17,6 +17,10 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SB = [sys.executable, os.path.join(ROOT, "signalbox.py")]
+# The demo plays its people too. Their decisions need a person at a terminal, which no environment variable can
+# claim, so they run through this wrapper, which says so in code.
+AS_PERSON = [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv.pop(1)); import signalbox as S; "
+             "S.person_present = lambda: True; sys.exit(S.main(sys.argv[1:]))", ROOT]
 
 
 def sh(*args, cwd=None, env=None, check=True, stdin=None):
@@ -28,10 +32,10 @@ def sh(*args, cwd=None, env=None, check=True, stdin=None):
 
 def sb(where, *args, user, agent=None, person=False, stdin=None, check=True):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SIGNALBOX_", "KANVAS_"))}
-    env.update(SIGNALBOX_USER=user, SIGNALBOX_TEST_TTY="1" if person else "0")
+    env.update(SIGNALBOX_USER=user, SIGNALBOX_TEST_TTY="0")
     if agent:
         env["SIGNALBOX_AGENT"] = agent
-    out = sh(*SB, *args, cwd=where, env=env, stdin=stdin, check=check)
+    out = sh(*(AS_PERSON if person else SB), *args, cwd=where, env=env, stdin=stdin, check=check)
     print(f"  {agent or '@' + user}$ signalbox {' '.join(args)}")
     return out
 

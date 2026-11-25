@@ -762,6 +762,13 @@ class Factory(World):
         self.assertIn("Only a person can finish without the checks",
                       self.sb("finish", "SB-1", "-m", "x", "--skip-checks", agent="claude-code", code=1))
 
+    def test_a_task_just_created_is_found_while_the_listing_lags(self):
+        self.sb("propose", "Docs", "Fresh", agent="claude-code")
+        hub = self.hub(agent="claude-code")
+        with mock.patch.object(hub.tracker, "list_issues", return_value=[]):  # GitHub has not listed it yet
+            board, t = hub.task("SB-1")
+        self.assertEqual(t["title"], "Fresh")
+
     def test_inbox_shows_people_what_waits_for_them(self):
         self.plan()
         self.sb("propose", "Docs", "Idea", agent="claude-code")

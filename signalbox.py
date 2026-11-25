@@ -1532,7 +1532,18 @@ class Hub:
 
     def task(self, ref, board=None):
         board = board or self.board()
-        t = K.task_map(board).get(self.tid(number_of(ref)).upper())
+        n = number_of(ref)
+        t = K.task_map(board).get(self.tid(n).upper())
+        if not t and n not in self._recent:
+            # GitHub's issue listing lags a few seconds behind writes: ask for the issue itself, then look again.
+            try:
+                self.issue(n)
+            except SignalboxError:
+                pass
+            else:
+                self.invalidate()
+                board = self.board()
+                t = K.task_map(board).get(self.tid(n).upper())
         if not t:
             raise SignalboxError(f"Task {ref} is not on the board (it may be withdrawn or rejected)")
         return board, t
