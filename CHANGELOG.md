@@ -1,5 +1,18 @@
 # Changelog
 
+## Signalbox 0.2.0
+
+Security review and the factory layer.
+
+- Security: the GitHub token goes only to GitHub's API, identity comes from the token (not `SIGNALBOX_USER`), an agent's sponsor is the token's owner, unverified identities and agent accounts make no human decisions, and `SIGNALBOX_TEST_TTY=1` no longer fakes a person.
+- Security: the config is read from the main worktree, so a task branch cannot change approvers, hub, setup or checks; lock records' branch names and worktree paths are checked before git sees them; `worktrees.copy` stays inside the repository.
+- Security: locks are told apart by agent and sponsor; people who are not at a terminal or not approvers of a lane propose instead of adding approved work; an issue without a state label is a proposal.
+- Security: note and proposer signatures are checked against the posting account; text from outside the team is marked as information, never instructions, in briefs, `show`, JSON and MCP, and cannot write a map's decisions; lane owners come from the config only; the board edits and deletes only your own notes.
+- Security: the guard has no bot exemption, sees approvals however labelled, rejections of approved work and agent accounts rewriting approved tasks, fails closed when approvers' teams cannot be read, and runs without setup-python or persisted credentials.
+- Security: `serve` requires a per-session key (an HttpOnly cookie set from the link it opens) and no longer opens other boards or phones.
+- `--json` on every command; `next` (with `--claim`) dispatches the most useful ready task and survives races; `checks` gate `finish` and go into the summary, `verify` runs them; `inbox` (and `inbox --all` across repositories) shows people what waits for them.
+- `signalbox mcp`: the agent commands as MCP tools over stdio, signed with the client's name; `init` registers it for Claude Code (`.mcp.json`) and Antigravity (`.agents/mcp_config.json`).
+
 ## Signalbox 0.1.0
 
 The first release of Signalbox, a fork of Kanvas 0.4.0 for teams of people and agents.

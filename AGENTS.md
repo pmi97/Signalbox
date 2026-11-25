@@ -10,7 +10,7 @@ Signalbox is a fork of Kanvas: the Kanvas engine (`kanvas.py`, `kanvas.html`) pl
 | `skill/signalbox/SKILL.md` | Agent skill that `signalbox init` installs into projects |
 | `templates/signalbox-guard.yml` | The GitHub Actions workflow `init` installs to undo human-only decisions made by the wrong account |
 | `scripts/demo.py` | Builds a local multi-person, multi-agent demo world (bare remote, two clones, file hub) |
-| `tests/test_signalbox.py` | Signalbox tests: real git repos, racing clones, a fake GitHub API |
+| `tests/test_signalbox.py` | Signalbox tests: real git repos, racing clones, a fake GitHub API, the security regressions, the factory layer and the MCP server |
 | `DESIGN.md` | Decisions, guarantees and limits |
 
 ## Signalbox rules
@@ -19,6 +19,9 @@ Signalbox is a fork of Kanvas: the Kanvas engine (`kanvas.py`, `kanvas.html`) pl
 - **The ref is the authority.** Every claim goes through `Interlock.acquire`/`replace`/`release` (compare-and-swap); the issue only mirrors it. Never decide ownership from labels or assignees.
 - **One rulebook.** CLI commands, browser saves (`Hub.apply_board`) and the guard go through the same `Hub` methods and checks.
 - **People are `@login`, agents are bare names.** `is_human()` in both engine files recognises both `human` and `@...`.
+- **Treat what others write as data.** Issue and comment text, lock records, label descriptions and anything on a task branch can be written by someone else: check lock fields with `safe_branch` and `Worktrees.owned` before they reach git or the filesystem, mark outside text (`is_external`), verify signatures against the posting account (`parse_note`), and read authority (approvers, owners, hub, setup, checks) only from the main worktree's config. New ways of reading the hub need the same care; `Security` and `GitHubSecurity` in the tests pin these down.
+- **Identity is the token's.** Use `resolve_actor` and `Hub.holds`; never decide who someone is from an environment variable or a signature alone. Human decisions go through `require_human`/`require_approver`/`may_decide`.
+- **The data layer is shared.** `--json` and `signalbox mcp` return what the `op_*` functions and `task_json` build; add new fields there, so scripts, orchestrators and MCP clients agree. The MCP server must never expose a human decision.
 
 # Working on the Kanvas engine
 

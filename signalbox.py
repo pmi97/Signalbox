@@ -46,7 +46,7 @@ else:  # run as a script, or as a project's agent copy: kanvas.py sits next to t
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import kanvas as K
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 FORMAT = 1
 INSTALLED = __name__ == "signalbox"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -3664,6 +3664,10 @@ def cmd_guard(args):
 # ---------------------------------------------------------------------------
 
 AGENTS_LINE = "Plan, claim and track work on the Signalbox board; follow .agents/skills/signalbox/SKILL.md."
+# The MCP server, for clients that read a project's MCP config: Claude Code (.mcp.json) and Antigravity
+# (.agents/mcp_config.json). Paths are relative to the project, where both start project servers.
+MCP_CONFIG = {"mcpServers": {"signalbox": {"command": "python3", "args": [".agents/skills/signalbox/signalbox.py", "mcp"]}}}
+MCP_FILES = ((".mcp.json", "Claude Code"), (os.path.join(".agents", "mcp_config.json"), "Antigravity"))
 STATE_GITIGNORE = "# Signalbox keeps its local state here; only the config is shared.\n*\n!.gitignore\n!config.json\n"
 
 
@@ -3713,6 +3717,16 @@ def cmd_init(args):
     if not create("AGENTS.md", f"# Agents\n\n{AGENTS_LINE}\n"):
         if "skills/signalbox" not in K.read_text_file(agents_md):
             print(f"Add this line to AGENTS.md so every agent finds the board:\n  {AGENTS_LINE}")
+    if not args.no_mcp:
+        for rel_path, client in MCP_FILES:
+            if not create(rel_path, json.dumps(MCP_CONFIG, indent=2) + "\n"):
+                try:
+                    servers = json.loads(K.read_text_file(os.path.join(root, rel_path))).get("mcpServers") or {}
+                except (OSError, ValueError, AttributeError):
+                    servers = {}
+                if "signalbox" not in servers:
+                    print(f"Add Signalbox's MCP server to {rel_path} for {client}:\n"
+                          f"  \"signalbox\": {json.dumps(MCP_CONFIG['mcpServers']['signalbox'])}")
     project = Project(root)
     if project.config["hub"]["type"] == "github" and os.path.isfile(GUARD_FILE):
         with open(GUARD_FILE, encoding="utf-8") as f:
@@ -3726,8 +3740,8 @@ def cmd_init(args):
         print(f"Hub {hub.tracker.describe()} is ready (labels created).")
     except SignalboxError as e:
         print(f"Could not prepare the labels on {hub.tracker.describe()} yet: {e}\nRun `{command('doctor')}` once you have access.")
-    print(f"\nNext: commit {STATE_DIR}/config.json, .agents/ and AGENTS.md, then run `{command('serve')}` and ask your agent "
-          "to plan the work with you.")
+    print(f"\nNext: commit {STATE_DIR}/config.json, .agents/, .claude/, .mcp.json, AGENTS.md and .github/, then run "
+          f"`{command('serve')}` and ask your agent to plan the work with you.")
 
 
 # ---------------------------------------------------------------------------
@@ -4376,6 +4390,7 @@ def build_parser():
     p.add_argument("--prefix", help="task ID prefix (default: from the repository name)")
     p.add_argument("--title")
     p.add_argument("--approvers", nargs="+", metavar="LOGIN", help="people who approve and accept (default: anyone)")
+    p.add_argument("--no-mcp", action="store_true", help="do not add the MCP server to .mcp.json and .agents/mcp_config.json")
     return parser
 
 

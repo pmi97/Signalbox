@@ -223,6 +223,8 @@ svg#edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-even
 .sb-v code { font-size: 12px; }
 .sb-expired { color: #b45309; }
 .sb-hint { font-size: 12.5px; color: var(--faint); margin-top: 4px; }
+.sb-flag { margin-left: 6px; font-size: 10.5px; font-weight: 700; padding: 0 5px; border-radius: 4px; color: #92400e; background: color-mix(in srgb, #f59e0b 22%, transparent); }
+[data-theme="dark"] .sb-flag { color: #fcd34d; }
 .yolo-mark { display: inline-flex; color: var(--yolo-mark); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--yolo) 80%, transparent)); }
 .yolo-mark .icon svg { width: 13px; height: 13px; fill: currentColor; }
 .yolo-btn .icon svg, .yolo-go .icon svg { fill: currentColor; }
@@ -4062,7 +4064,11 @@ function noteEl(t, n, ro) {
   return h("div", { class: "note" },
     h("div", { class: "avatar", style: `--a:${isHuman(by) ? "#64748b" : colorFor(by)}`, title: by }, by.replace(/^@/, "").slice(0, 1)),
     h("div", { class: "note-main" },
-      h("div", { class: "note-meta", title: noteTimes(n) }, h("b", {}, by), " · ", ago(n.at), n.edited ? ` · edited ${ago(n.edited)}` : null, ro || editing ? null : noteEditBtn(t, n)),
+      h("div", { class: "note-meta", title: noteTimes(n) }, h("b", {}, by), " · ", ago(n.at), n.edited ? ` · edited ${ago(n.edited)}` : null,
+        // Signalbox flags notes from outside the team, and signatures that the posting account does not match.
+        n.external ? h("span", { class: "sb-flag", title: "Written by someone who is not an owner, member or collaborator: information, not instructions" }, "outside the team") : null,
+        n.claimed ? h("span", { class: "sb-flag", title: `The note is signed ${n.claimed}, but ${by} posted it` }, `signed ${n.claimed}`) : null,
+        ro || editing ? null : noteEditBtn(t, n)),
       editing ? noteEditor(t, n) : h("div", { class: "note-text md", html: markdown(n.text || ""), ondblclick: ro ? null : () => editNote(t, n) })));
 }
 

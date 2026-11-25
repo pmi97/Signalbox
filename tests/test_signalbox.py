@@ -997,8 +997,11 @@ class InitTests(unittest.TestCase):
         self.assertEqual(read(os.path.join(tmp, "AGENTS.md")), "# Ours\n")
         for rel in (".signalbox/config.json", ".signalbox/.gitignore", ".agents/skills/signalbox/signalbox.py",
                     ".agents/skills/signalbox/kanvas.py", ".agents/skills/signalbox/kanvas.html",
-                    ".agents/skills/signalbox/SKILL.md", ".claude/skills/signalbox/SKILL.md"):
+                    ".agents/skills/signalbox/SKILL.md", ".claude/skills/signalbox/SKILL.md", ".mcp.json",
+                    ".agents/mcp_config.json"):
             self.assertTrue(os.path.isfile(os.path.join(tmp, rel)), rel)
+        mcp = json.loads(read(os.path.join(tmp, ".mcp.json")))["mcpServers"]["signalbox"]
+        self.assertEqual(mcp["args"], [".agents/skills/signalbox/signalbox.py", "mcp"])
         cfg = json.loads(read(os.path.join(tmp, ".signalbox", "config.json")))
         self.assertEqual((cfg["prefix"], cfg["hub"]["type"]), ("AC", "file"))
         # The agents' copy runs on its own.

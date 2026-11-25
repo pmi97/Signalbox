@@ -72,7 +72,7 @@ git add .signalbox/config.json .agents .claude AGENTS.md .github && git commit -
 python .agents/skills/signalbox/signalbox.py serve
 ```
 
-`init` writes `.signalbox/config.json` and installs the agent skill and its own copy of Signalbox in `.agents/skills/signalbox/`, so agents and teammates need nothing installed. It also copies the skill to `.claude/skills/signalbox/` for Claude Code, adds `AGENTS.md` if you have none, adds `.github/workflows/signalbox-guard.yml`, and creates the labels on the hub. It never overwrites your files. With `uv tool install` or `pipx install` on this repository, you get the `signalbox` command (and `sbx`).
+`init` writes `.signalbox/config.json` and installs the agent skill and its own copy of Signalbox in `.agents/skills/signalbox/`, so agents and teammates need nothing installed. It also copies the skill to `.claude/skills/signalbox/` for Claude Code, registers the MCP server in `.mcp.json` (Claude Code) and `.agents/mcp_config.json` (Antigravity), adds `AGENTS.md` if you have none, adds `.github/workflows/signalbox-guard.yml`, and creates the labels on the hub. It never overwrites your files; rerun it to update the agents' copy of Signalbox. With `uv tool install` or `pipx install` on this repository, you get the `signalbox` command (and `sbx`).
 
 Then ask your agent:
 
@@ -101,6 +101,35 @@ signalbox ask SB-12 "24h or 30d sessions?"  # and stop until the person answers
 signalbox finish SB-12 -m "What changed, how I checked, what to look at"   # pushes, review, releases
 signalbox handoff SB-12 --to bob -m "Half done: ..."                       # bob resumes with claim
 ```
+
+## In Claude Code and Antigravity
+
+After `init`, both pick Signalbox up from the repository itself, so it works the same on your laptop and in cloud sessions:
+
+| | Claude Code (CLI, desktop, web) | Antigravity |
+|---|---|---|
+| Instructions | `.claude/skills/signalbox/SKILL.md` and `AGENTS.md` | `.agents/skills/signalbox/SKILL.md` and `AGENTS.md` |
+| Tools | `.mcp.json` starts `signalbox mcp` (approve it once) | `.agents/mcp_config.json` starts `signalbox mcp` |
+| Signature | the MCP client's name (`claude-code`), or `SIGNALBOX_AGENT` | the MCP client's name, or `SIGNALBOX_AGENT` |
+
+`signalbox mcp` serves the agent commands as MCP tools (`signalbox_status`, `signalbox_next`, `signalbox_claim`, `signalbox_finish`, ...) over stdio, using only the standard library. It always acts as an agent, so no tool can approve, accept or break a lock. It finds the project from `--dir`, `$SIGNALBOX_DIR`, the client's workspace roots, or the folder it starts in. Where `python3` is not the name of Python (Windows), change `command` in those two files to `py` or `python`. Agents without MCP use the same commands through the shell, and `--json` gives them answers to parse.
+
+## Running a software factory
+
+Signalbox is the dispatcher, the lock manager and the review queue between your people and any number of headless agents:
+
+```bash
+# A worker: take the most useful ready task, work it in its own worktree, hand it to review. Repeat.
+while signalbox next --claim --json --as worker-3 > claim.json; do
+  wt=$(python3 -c 'import json; print(json.load(open("claim.json"))["claimed"]["worktree"])')
+  (cd "$wt" && your-agent --prompt-file .signalbox/TASK.md)   # it calls `signalbox finish` itself
+done   # exit code 2: nothing is ready
+```
+
+- **`next`** ranks ready tasks: work sent back with feedback first, then YOLO chains, handoffs to you, and what unblocks the most. `--claim` takes the best one and moves on when another worker wins the race. Filter with `--lane`, `--kind`, `--map`.
+- **Quality gates**: `"checks": {"run": ["npm test", "npm run lint"]}` in the config runs those commands in the task's worktree on `finish`. A failure keeps the task in doing and tells the agent what failed; the results go into the summary people review. `verify` runs them alone. Only people may finish without them.
+- **`--json`** on every command, with a stable task shape (state, lock, question, changes requested, sent-back feedback, YOLO) and errors as `{"error": ..., "locked": true}`.
+- **`inbox`** tells a person what waits for them in one project: proposals to approve, work to review, their agents' questions, handoffs, expired leases. `inbox --all` searches every Signalbox board of yours (and `--owner ORG`) on GitHub.
 
 ## For people
 
@@ -141,7 +170,8 @@ The map is an issue with Wayfinder's sections: Destination, Notes, Decisions so 
   "agents": {"lease_minutes": 120, "max_claims": 2, "hitl_needs_pair": true, "logins": ["acme-agents-bot"]},
   "locks": {"remote": "auto", "namespace": "refs/signalbox/locks"},
   "worktrees": {"dir": "../{repo}.worktrees", "base": "", "copy": [".env"], "setup": "npm ci", "port_base": 4100},
-  "paths": "warn"
+  "paths": "warn",
+  "checks": {"run": ["npm test"], "block": true, "timeout_seconds": 1800}
 }
 ```
 
@@ -151,13 +181,26 @@ The map is an issue with Wayfinder's sections: Destination, Notes, Decisions so 
 
 | | |
 |---|---|
-| Read | `status`, `ready`, `frontier [MAP]`, `blocked`, `list [FILTER]`, `show ID`, `locks`, `worktrees`, `radar`, `whoami`, `check`, `doctor` |
-| Work (agents and people) | `claim`, `heartbeat`, `note`, `ask`, `finish [--pr]`, `resolve`, `pause`, `handoff`, `unlock` (your own lock) |
+| Read | `status`, `inbox [--all]`, `next`, `ready`, `frontier [MAP]`, `blocked`, `list [FILTER]`, `show ID`, `locks`, `worktrees`, `radar`, `whoami`, `check`, `doctor` |
+| Work (agents and people) | `next --claim`, `claim`, `heartbeat`, `note`, `ask`, `verify`, `finish [--pr]`, `resolve`, `pause`, `handoff`, `unlock` (your own lock) |
 | Plan | `propose`, `batch`, `add-lane`, `depend`, `undepend`, `edit`, `withdraw`, `map new/show`, `fog`, `graduate`, `scope-out` |
 | Decide (people) | `approve`, `changes`, `accept`, `send-back`, `reject`, `yolo`, `unlock` (anyone's) |
-| Run | `init`, `serve`, `sync`, `gc`, `export`, `guard` |
+| Run | `init`, `serve`, `mcp`, `sync`, `gc`, `export`, `guard` |
 
-`signalbox <command> -h` explains each one. [DESIGN.md](DESIGN.md) covers the design decisions, the guarantees and their limits.
+Every command takes `--json`. `signalbox <command> -h` explains each one. [DESIGN.md](DESIGN.md) covers the design decisions, the guarantees and their limits.
+
+## Security
+
+Signalbox holds GitHub tokens, runs git and shell commands, and feeds text to agents, so it treats the hub, the lock refs and the repository's branches as places other people write:
+
+- **Identity comes from the token.** On GitHub you are whoever your token belongs to; `SIGNALBOX_USER` cannot change that, and an agent's sponsor is the token's owner. An identity GitHub does not confirm, or an agent account's token, makes no human decisions.
+- **The config that rules is the main checkout's.** A task branch cannot change approvers, the hub, the setup command or the checks until it is merged. The token goes only to `api.github.com`, the host of your `origin`, or a host you name in `SIGNALBOX_GITHUB_HOSTS`.
+- **Lock records are data, not commands.** Branch names and worktree paths from them are checked before git sees them; locks are told apart by agent *and* sponsor.
+- **Outside text is marked.** Comments and issues by people who are not owners, members or collaborators are flagged as information, not instructions, in briefs, `show`, JSON and MCP; signatures that claim another person show who really posted them.
+- **The board server is private.** `serve` makes a secret key per session, opens the board with it, and refuses requests without it, so another account on the machine, or an agent that would rather approve its own work, cannot act as you through it.
+- **The guard closes GitHub's side**: approvals however they are labelled, send-backs, acceptances, rejections, YOLO, and agent accounts rewriting approved tasks, by any account that may not decide, bots included. It reads the rules from the default branch.
+
+Limits and the reasoning behind each choice are in [DESIGN.md](DESIGN.md#trust-boundaries). Report security problems privately to the maintainers rather than in an issue.
 
 ## Development
 
