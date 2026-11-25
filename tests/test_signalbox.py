@@ -710,6 +710,129 @@ class Security(World):
         self.assertEqual(actor.name, "acme-bot")
 
 
+class Factory(World):
+    """What a software factory runs on: JSON, a dispatcher that never fights over a task, gates, an inbox, MCP."""
+
+    config = {"approvers": ["alice"], "checks": {"run": ["test -f ok.txt"]}}
+
+    def js(self, *argv, **kw):
+        return json.JSONDecoder().raw_decode(self.sb("--json", *argv, **kw))[0]  # stderr may follow the JSON
+
+    def test_json_everywhere(self):
+        self.plan()
+        st = self.js("status", agent="claude-code")
+        self.assertEqual(st["counts"], {"todo": 2, "blocked": 1})
+        self.assertEqual({t["id"]: t["state"] for t in st["tasks"]}, {"SB-1": "todo", "SB-2": "blocked", "SB-3": "todo"})
+        self.assertEqual(self.js("show", "SB-2", agent="claude-code")["waiting_on"], ["SB-1"])
+        claim = self.js("claim", "SB-3", agent="claude-code")
+        self.assertEqual((claim["task"], claim["branch"]), ("SB-3", "sb/sb-3-write-the-docs"))
+        self.assertTrue(os.path.isfile(claim["brief"]))
+        self.assertEqual(self.js("locks")["locks"][0]["holder"], "claude-code")
+        err = self.js("claim", "SB-3", "--no-worktree", at=self.bob, user="bob", agent="codex", code=3)
+        self.assertTrue(err["locked"])
+        me = self.js("whoami", agent="claude-code")
+        self.assertEqual((me["name"], me["sponsor"], me["person"]), ("claude-code", "alice", False))
+
+    def test_next_takes_the_most_useful_task_and_survives_races(self):
+        self.plan()
+        nxt = self.js("next", agent="claude-code")["next"]
+        self.assertEqual(nxt["id"], "SB-1")  # SB-2 waits on it, so it unblocks the most
+        self.sb("claim", "SB-1", "--no-worktree", at=self.bob, user="bob", agent="codex")
+        with mock.patch.object(S, "candidates", lambda hub, board, *a, **k: [K.task_map(board)["SB-1"], K.task_map(board)["SB-3"]]):
+            res = self.js("next", "--claim", "--no-worktree", agent="claude-code")
+        self.assertEqual((res["claimed"]["task"], res["claimed"]["lost_races"]), ("SB-3", ["SB-1"]))
+        self.assertIsNone(self.js("next", agent="gemini", code=2)["next"])
+
+    def test_checks_gate_finish_and_go_into_the_summary(self):
+        self.plan()
+        claim = self.js("claim", "SB-3", agent="claude-code")
+        out = self.sb("finish", "SB-3", "-m", "Docs", agent="claude-code", code=1)
+        self.assertIn("stays in doing: 1 check(s) failed", out)
+        self.assertEqual(self.state("SB-3"), "doing")
+        self.assertEqual(self.sb("verify", agent="claude-code", code=1).split()[0], "FAIL")
+        with open(os.path.join(claim["worktree"], "ok.txt"), "w") as f:
+            f.write("ok\n")
+        sh("git", "add", "ok.txt", cwd=claim["worktree"])
+        sh("git", "commit", "-q", "-m", "ok", cwd=claim["worktree"])
+        self.assertTrue(self.js("verify", "SB-3", agent="claude-code")["ok"])
+        res = self.js("finish", "SB-3", "-m", "Docs", agent="claude-code")
+        self.assertEqual((res["to"], res["checks"][0]["ok"]), ("review", True))
+        self.assertIn("Checks: ✅ `test -f ok.txt`", K.task_map(self.board())["SB-3"]["notes"][-1]["text"])
+        self.sb("claim", "SB-1", agent="claude-code")
+        self.assertIn("Only a person can finish without the checks",
+                      self.sb("finish", "SB-1", "-m", "x", "--skip-checks", agent="claude-code", code=1))
+
+    def test_inbox_shows_people_what_waits_for_them(self):
+        self.plan()
+        self.sb("propose", "Docs", "Idea", agent="claude-code")
+        self.sb("claim", "SB-3", "--no-worktree", agent="claude-code")
+        self.sb("ask", "SB-3", "Which audience?", agent="claude-code")
+        self.sb("claim", "SB-1", "--no-worktree", agent="codex")
+        self.sb("finish", "SB-1", "-m", "Designed", agent="codex")
+        box = self.js("inbox", tty=True)
+        self.assertEqual([t["id"] for t in box["approve"]], ["SB-4"])
+        self.assertEqual([t["id"] for t in box["review"]], ["SB-1"])
+        self.assertEqual(box["questions"][0]["question"], "Which audience?")
+        self.assertEqual(self.js("inbox", at=self.bob, user="bob", tty=True)["approve"], [])
+
+    def mcp(self, *messages, agent=None):
+        out = io.StringIO()
+        env = dict(CLEAN_ENV, SIGNALBOX_USER="alice")
+        with mock.patch.dict(os.environ, env, clear=True), chdir(self.alice):
+            server = S.McpServer(agent=agent, out=out)
+            server.serve(io.StringIO("".join(json.dumps(m) + "\n" for m in messages)))
+        return [json.loads(x) for x in out.getvalue().splitlines()], server
+
+    def test_mcp_serves_the_agent_commands(self):
+        self.plan()
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "Claude Code", "version": "2"}, "capabilities": {}}}
+        replies, server = self.mcp(init, {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                                   {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                                   {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "signalbox_next", "arguments": {"claim": True}}},
+                                   {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "signalbox_claim", "arguments": {"id": "SB-1"}}},
+                                   {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "signalbox_approve", "arguments": {"id": "SB-1"}}},
+                                   {"jsonrpc": "2.0", "id": 6, "method": "nope"})
+        by_id = {r["id"]: r for r in replies}
+        self.assertEqual(by_id[1]["result"]["protocolVersion"], "2025-06-18")
+        self.assertEqual(server.agent, "claude-code")
+        names = {t["name"] for t in by_id[2]["result"]["tools"]}
+        self.assertIn("signalbox_finish", names)
+        self.assertFalse(names & {"signalbox_approve", "signalbox_accept", "signalbox_yolo", "signalbox_unlock"})
+        claimed = by_id[3]["result"]["structuredContent"]["claimed"]
+        self.assertEqual(claimed["task"], "SB-1")
+        self.assertTrue(os.path.isdir(claimed["worktree"]))
+        self.assertTrue(by_id[4]["result"]["isError"] is False)  # already yours: the lease is renewed
+        self.assertTrue(by_id[5]["result"]["isError"])
+        self.assertEqual(by_id[6]["error"]["code"], -32601)
+        lock = K.task_map(self.board())["SB-1"]["sb"]["lock"]
+        self.assertEqual(lock["label"], "claude-code (for @alice)")
+
+    def test_mcp_finds_the_project_from_the_clients_roots(self):
+        out = io.StringIO()
+        server = S.McpServer(agent="codex", out=out)
+        server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {}}}})
+        server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertEqual(json.loads(out.getvalue())["method"], "roots/list")
+        server.handle({"jsonrpc": "2.0", "id": "signalbox-roots", "result": {"roots": [{"uri": "file://" + self.alice}]}})
+        self.assertEqual(server.dir, self.alice)
+
+    def test_mcp_over_stdio_in_a_real_process(self):
+        self.plan()
+        env = dict(CLEAN_ENV, SIGNALBOX_USER="alice")
+        msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                                                            "clientInfo": {"name": "antigravity"}}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "signalbox_status", "arguments": {}}}]
+        p = subprocess.run([sys.executable, SCRIPT, "mcp"], cwd=self.alice, env=env, capture_output=True, text=True,
+                           input="".join(json.dumps(m) + "\n" for m in msgs), timeout=60)
+        replies = [json.loads(x) for x in p.stdout.splitlines()]
+        self.assertEqual([r["id"] for r in replies], [1, 2], p.stderr)
+        status = replies[1]["result"]["structuredContent"]
+        self.assertEqual(status["you"], "antigravity (for @alice)")
+        self.assertEqual(len(status["tasks"]), 3)
+
+
 class GitHubSecurity(unittest.TestCase):
     def test_the_token_goes_only_to_github(self):
         with self.assertRaisesRegex(S.SignalboxError, "not a GitHub API"):
