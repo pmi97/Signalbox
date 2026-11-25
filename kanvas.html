@@ -809,6 +809,23 @@ dialog.dlg[open]:has(> form > .help) { display: flex; flex-direction: column; }
     const p = JSON.parse(localStorage.getItem("kanvas:prefs") || "{}");
     document.documentElement.dataset.theme = p.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
   } catch (e) { document.documentElement.dataset.theme = "light"; }
+  // Signalbox serves a board with a session key. It arrives once in the URL's fragment, which no server sees; the
+  // page keeps it for this tab in storage scoped to this origin (port included) and sends it to its own server only.
+  (() => {
+    const m = /^#sbkey=([A-Za-z0-9_-]{16,})$/.exec(location.hash);
+    let key = m ? m[1] : null;
+    try { if (key) sessionStorage.setItem("signalbox:key", key); else key = sessionStorage.getItem("signalbox:key"); } catch (e) { /* storage off */ }
+    if (m) history.replaceState(null, "", location.pathname + location.search);
+    if (!key) return;
+    const plain = window.fetch.bind(window);
+    window.fetch = (input, opts = {}) => {
+      const url = new URL(typeof input === "string" ? input : input.url, location.href);
+      if (url.origin !== location.origin) return plain(input, opts);
+      const headers = new Headers(opts.headers || (typeof input === "string" ? undefined : input.headers));
+      headers.set("X-Signalbox-Key", key);
+      return plain(input, Object.assign({}, opts, { headers }));
+    };
+  })();
 </script>
 <header class="top">
   <div class="brand">

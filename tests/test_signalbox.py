@@ -499,7 +499,7 @@ class Guard(World):
         raw = {"number": number, "id": issue["id"], "title": issue["title"], "body": issue["body"],
                "labels": [{"name": x} for x in issue["labels"]], "state": issue["state"], "state_reason": reason,
                "assignees": [], "user": {"login": "alice"}}
-        if label and label not in issue["labels"]:
+        if action == "labeled" and label and label not in issue["labels"]:  # unlabeled payloads lack the label
             raw["labels"].append({"name": label})
         ev = {"action": action, "issue": raw, "sender": {"login": sender}}
         if label:
@@ -531,6 +531,29 @@ class Guard(World):
         self.sb("claim", "SB-2", "--no-worktree", agent="claude-code")
         self.assertIsNone(self.event("labeled", 2, "acme-bot", "sb:todo"))
         self.assertIn("undid turn YOLO on", self.event("labeled", 2, "acme-bot", "sb:yolo"))
+
+    def test_guard_sees_tasks_taken_off_the_board_or_demoted(self):
+        self.sb("propose", "Docs", "Approved work", agent="claude-code")
+        self.sb("approve", "SB-1", tty=True)
+        hub = self.hub()
+        # Taking the signalbox label off, to change the task unguarded and put it back.
+        hub.tracker.remove_label(1, "signalbox")
+        self.assertIn("undid take approved work off the board by @acme-bot", self.event("unlabeled", 1, "acme-bot", "signalbox"))
+        self.assertIn("signalbox", hub.tracker.get_issue(1)["labels"])
+        # Putting an issue on the board already approved.
+        hub.tracker.create_issue("Sneaky", "", ["sb:todo", "sb:yolo"])
+        hub.tracker.add_labels(2, ["signalbox"])
+        self.assertIn("undid put approved work on the board", self.event("labeled", 2, "carol", "signalbox"))
+        self.assertEqual(sorted(hub.tracker.get_issue(2)["labels"]), ["sb:proposed", "signalbox"])
+        # Demoting approved work to a proposal by taking its state label off: put back.
+        hub.tracker.remove_label(1, "sb:todo")
+        self.assertIn("undid move approved work back to proposed", self.event("unlabeled", 1, "acme-bot", "sb:todo"))
+        self.assertEqual(self.state("SB-1"), "todo")
+        # A pause takes doing off after adding todo, and a close takes labels off a closed issue: no decisions.
+        self.sb("claim", "SB-1", "--no-worktree", agent="claude-code")
+        self.sb("pause", "SB-1", agent="claude-code")
+        self.assertIsNone(self.event("unlabeled", 1, "acme-bot", "sb:doing"))
+        self.assertIsNone(self.event("unlabeled", 2, "alice", "signalbox"))
 
     def test_guard_restores_approved_tasks_that_agent_accounts_rewrite(self):
         self.sb("propose", "Docs", "Write the guide", "Cover install and upgrade", agent="claude-code")
@@ -673,6 +696,55 @@ class Security(World):
         self.assertFalse(os.path.exists(evil))
         hub.locks.release(3, sha)
 
+    def test_copies_never_write_through_a_symlink_the_branch_committed(self):
+        with open(os.path.join(self.alice, ".env"), "w") as f:
+            f.write("SECRET=1\n")
+        hub = self.hub()
+        hub.worktrees.cfg = dict(hub.worktrees.cfg, copy=[".env"])
+        dst = os.path.join(self.tmp, "box")
+        os.makedirs(dst)
+        os.symlink(os.path.join(self.tmp, "stolen.txt"), os.path.join(dst, ".env"))  # dangling
+        hub.worktrees.bootstrap(dst, {}, "brief")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "stolen.txt")))
+        os.makedirs(os.path.join(self.tmp, "outside"))
+        os.remove(os.path.join(dst, ".env"))
+        hub.worktrees.cfg = dict(hub.worktrees.cfg, copy=["conf/.env"])
+        os.makedirs(os.path.join(self.alice, "conf"))
+        shutil.copy(os.path.join(self.alice, ".env"), os.path.join(self.alice, "conf", ".env"))
+        os.symlink(os.path.join(self.tmp, "outside"), os.path.join(dst, "conf"))
+        warnings = hub.worktrees.bootstrap(dst, {}, "brief")
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "outside")), [])
+        self.assertTrue(any("leads outside" in w for w in warnings))
+
+    def test_a_bare_repositorys_worktrees_read_the_config_from_head(self):
+        bare = os.path.join(self.tmp, "bare.git")
+        sh("git", "clone", "--quiet", "--bare", self.remote, bare)
+        wt = os.path.join(self.tmp, "bare-wt")
+        sh("git", "-C", bare, "worktree", "add", "--quiet", "-b", "evil", wt, "main")
+        cfg_path = os.path.join(wt, ".signalbox", "config.json")
+        cfg = json.loads(read(cfg_path))
+        cfg["approvers"] = ["mallory"]
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        project = S.Project(wt)
+        self.assertTrue(project.linked)
+        self.assertEqual(project.config_source, "HEAD:.signalbox/config.json")
+        self.assertNotIn("mallory", project.config["approvers"])
+
+    def test_approved_work_changes_lane_only_with_its_approvers(self):
+        self.plan()  # alice owns Platform; bob owns no lane and is no approver
+        self.assertIn("cannot move an approved task", self.sb("edit", "SB-3", "--lane", "Platform", at=self.bob, user="bob", tty=True, code=1))
+        self.sb("edit", "SB-3", "--lane", "Platform", tty=True)
+        self.assertEqual(K.task_map(self.board())["SB-3"]["sb"]["lane"], "Platform")
+
+    def test_redirects_drop_the_token_on_another_host(self):
+        handler = S.GitHubTracker._Redirects()
+        req = S.urllib.request.Request("https://api.github.com/repos/o/r", headers={"Authorization": "Bearer t"})
+        same = handler.redirect_request(req, None, 301, "Moved", {}, "https://api.github.com/repositories/1")
+        other = handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example/x")
+        self.assertEqual(same.get_header("Authorization"), "Bearer t")
+        self.assertIsNone(other.get_header("Authorization"))
+
     def test_copied_files_stay_inside_the_repository(self):
         with open(os.path.join(self.tmp, "secret.txt"), "w") as f:
             f.write("s3cret")
@@ -775,6 +847,13 @@ class Factory(World):
         self.sb("claim", "SB-3", "--no-worktree", agent="claude-code")
         self.sb("ask", "SB-3", "Which audience?", agent="claude-code")
         self.sb("claim", "SB-1", "--no-worktree", agent="codex")
+        self.assertIn("cannot be finished without its checks", self.sb("finish", "SB-1", "-m", "Designed", agent="codex", code=1))
+        self.sb("pause", "SB-1", agent="codex")
+        wt = self.js("claim", "SB-1", agent="codex")["worktree"]
+        with open(os.path.join(wt, "ok.txt"), "w") as f:
+            f.write("ok\n")
+        sh("git", "add", "ok.txt", cwd=wt)
+        sh("git", "commit", "-q", "-m", "ok", cwd=wt)
         self.sb("finish", "SB-1", "-m", "Designed", agent="codex")
         box = self.js("inbox", tty=True)
         self.assertEqual([t["id"] for t in box["approve"]], ["SB-4"])
@@ -952,24 +1031,46 @@ class ServerKey(World):
 
     def test_the_board_answers_only_with_the_key(self):
         base = f"/{self.name}/"
-        self.assertEqual(self.request("GET", base)[0], 401)
+        key = {"X-Signalbox-Key": self.server.key}
+        # The page is the same kanvas.html for everyone and loads without the key; nothing else does.
+        self.assertEqual(self.request("GET", base)[0], 200)
+        self.assertEqual(self.request("GET", "/")[0], 401)
         self.assertEqual(self.request("GET", base + "api/board")[0], 401)
-        self.assertEqual(self.request("GET", base + "?key=wrong")[0], 401)
+        self.assertEqual(self.request("GET", base + "api/board?key=" + self.server.key)[0], 401)  # never in a URL
+        self.assertEqual(self.request("GET", base + "api/board", headers={"X-Signalbox-Key": "wrong"})[0], 401)
         self.assertEqual(self.request("PUT", base + "api/board", body="{}", headers={"Content-Type": "application/json", "If-Match": "x"})[0], 401)
         self.assertEqual(self.request("POST", "/api/boards", body="{}", headers={"Content-Type": "application/json"})[0], 401)
-        status, headers, _ = self.request("GET", base + "?key=" + self.server.key)
-        self.assertEqual((status, headers["Location"]), (302, base))
-        cookie = headers["Set-Cookie"].split(";")[0]
-        self.assertIn("HttpOnly", headers["Set-Cookie"])
-        self.assertEqual(self.request("GET", base + "api/board", cookie=cookie)[0], 200)
-        self.assertEqual(self.request("GET", base, cookie=cookie)[0], 200)
+        self.assertEqual(self.request("GET", base + "api/board", cookie="signalbox_1=" + self.server.key)[0], 401)
+        status, headers, _ = self.request("GET", base + "api/board", headers=key)
+        self.assertEqual(status, 200)
+        self.assertNotIn("Set-Cookie", headers)
         # Images would stay on this computer while the notes go to GitHub: refused, with the reason.
-        status, _, body = self.request("POST", base + "api/files", cookie=cookie, body=b"\x89PNG\r\n", headers={"Content-Type": "image/png"})
+        status, _, body = self.request("POST", base + "api/files", body=b"\x89PNG\r\n", headers=dict(key, **{"Content-Type": "image/png"}))
         self.assertEqual(status, 403)
         self.assertIn(b"attach them to the issue on GitHub", body)
         # Even with the key, a Signalbox server opens no other boards and nothing to phones.
-        self.assertEqual(self.request("POST", "/api/boards", cookie=cookie, body="{}", headers={"Content-Type": "application/json"})[0], 403)
-        self.assertEqual(self.request("GET", base + "api/board", cookie="signalbox_1=" + self.server.key)[0], 401)
+        self.assertEqual(self.request("POST", "/api/boards", body="{}", headers=dict(key, **{"Content-Type": "application/json"}))[0], 403)
+
+    def test_the_browser_gets_the_key_through_a_private_file(self):
+        link, folder = S.private_link(f"http://127.0.0.1:{self.port}/{self.name}/#sbkey={self.server.key}")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = link[len("file://"):]
+        self.assertTrue(os.path.isfile(path))
+        self.assertNotIn(self.server.key, link)
+        if os.name == "posix":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+        self.assertIn(self.server.key, read(path))
+
+    def test_only_a_person_at_a_terminal_starts_the_board(self):
+        args = S.build_parser().parse_args(["serve", "--no-open", "--port", "0"])
+        with mock.patch.dict(os.environ, dict(CLEAN_ENV, SIGNALBOX_USER="alice", SIGNALBOX_AGENT="claude-code"), clear=True), chdir(self.alice):
+            with self.assertRaisesRegex(S.SignalboxError, "a person's board"):
+                S.cmd_serve(args)
+        with mock.patch.dict(os.environ, dict(CLEAN_ENV, SIGNALBOX_USER="alice"), clear=True), chdir(self.alice), \
+                mock.patch.object(S, "person_present", return_value=False):
+            with self.assertRaisesRegex(S.SignalboxError, "person at the terminal"):
+                S.cmd_serve(args)
 
 
 class FakeGitHub:

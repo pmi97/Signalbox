@@ -34,10 +34,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from http.cookies import CookieError, SimpleCookie
 import webbrowser
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import quote, urlparse
 
 if __package__:  # installed: the Kanvas engine is the kanvas_board package beside this one
     import kanvas_board as K
@@ -242,13 +241,27 @@ class Project:
             self.root = git("rev-parse", "--show-toplevel", cwd=start)
             common = git("rev-parse", "--git-common-dir", cwd=start)  # relative to `start` before git 2.31's --path-format
             common = common if os.path.isabs(common) else os.path.join(start, common)
+            gitdir = git("rev-parse", "--git-dir", cwd=start)
+            gitdir = gitdir if os.path.isabs(gitdir) else os.path.join(start, gitdir)
         except SignalboxError:
             raise SignalboxError("Signalbox works inside a git repository; run `git init` first, or cd into one")
         self.root = os.path.abspath(self.root)
         self.common = os.path.abspath(common)
+        # A linked worktree (a task's, or any worktree of a bare repository) has a git dir of its own.
+        self.linked = os.path.normcase(os.path.abspath(gitdir)) != os.path.normcase(self.common)
         self.main = os.path.dirname(self.common) if os.path.basename(self.common) == ".git" else self.root
         self.config_path = self._find_config(start)
-        self.config = load_config(self.config_path) if self.config_path else None
+        self.config_source = self.config_path
+        if self.config_path:
+            self.config = load_config(self.config_path)
+        elif self.linked:
+            # No checkout holds the config (a bare repository's worktrees): the committed one on the repository's
+            # HEAD rules, never the copy on this worktree's branch.
+            p = git("--git-dir", self.common, "show", f"HEAD:{STATE_DIR}/{CONFIG_FILE}", check=False)
+            self.config_source = f"HEAD:{STATE_DIR}/{CONFIG_FILE}"
+            self.config = load_config(self.config_source, text=p.stdout) if p.returncode == 0 else None
+        else:
+            self.config = None
 
     def _find_config(self, start):
         """The config that rules this repository. In a task worktree it is the main worktree's, never the copy on the
@@ -263,15 +276,15 @@ class Project:
             if os.path.abspath(d) == self.root or os.path.dirname(d) == d:
                 break
             d = os.path.dirname(d)
-        if os.path.normcase(self.root) != os.path.normcase(self.main):
+        if self.linked:
+            if os.path.normcase(self.root) == os.path.normcase(self.main):
+                return None  # no main checkout to read from: the caller reads HEAD's
             if found:
                 twin = os.path.join(self.main, os.path.relpath(found, self.root))
                 if os.path.isfile(twin):
                     return twin
             p = os.path.join(self.main, STATE_DIR, CONFIG_FILE)
-            if os.path.isfile(p):
-                return p
-            return found
+            return p if os.path.isfile(p) else None
         if found:
             return found
         p = os.path.join(self.main, STATE_DIR, CONFIG_FILE)
@@ -323,9 +336,9 @@ def merge_defaults(cfg, defaults):
     return out
 
 
-def load_config(path):
+def load_config(path, text=None):
     try:
-        cfg = json.loads(K.read_text_file(path))
+        cfg = json.loads(K.read_text_file(path) if text is None else text)
     except (OSError, ValueError) as e:
         raise SignalboxError(f"Cannot read {path}: {e}")
     if not isinstance(cfg, dict):
@@ -590,6 +603,15 @@ class GitHubTracker:
                 self._token = run(["gh", "auth", "token"], check=False).stdout.strip()
         return self._token
 
+    class _Redirects(urllib.request.HTTPRedirectHandler):
+        """Follow GitHub's redirects (renamed repositories), but never carry the token to another host."""
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            new = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if new is not None and (urlparse(newurl).hostname or "").lower() != (urlparse(req.full_url).hostname or "").lower():
+                new.remove_header("Authorization")
+            return new
+
     def _same_origin(self, url):
         a, b = urlparse(self.api), urlparse(url)
         return (a.scheme, (a.hostname or "").lower(), a.port) == (b.scheme, (b.hostname or "").lower(), b.port) and \
@@ -606,7 +628,7 @@ class GitHubTracker:
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=30) as res:
+            with urllib.request.build_opener(self._Redirects).open(req, timeout=30) as res:
                 raw = res.read()
                 return res.status, json.loads(raw) if raw else None, dict(res.headers)
         except urllib.error.HTTPError as e:
@@ -1091,8 +1113,14 @@ class Worktrees:
                     continue
                 rel_path = os.path.relpath(src, main)
                 dst = os.path.join(path, rel_path)
-                if os.path.isfile(src) and not os.path.exists(dst):
+                # lexists: a symlink the branch committed at the destination (even a dangling one) is never written
+                # through, and the folder it lands in must really be inside the worktree.
+                if os.path.isfile(src) and not os.path.lexists(dst):
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    real = os.path.realpath(os.path.dirname(dst))
+                    if os.path.commonpath([real, os.path.realpath(path)]) != os.path.realpath(path):
+                        warnings.append(f"Skipped copying {rel_path}: its folder in the worktree leads outside it")
+                        continue
                     shutil.copy2(src, dst)
         state = os.path.join(path, STATE_DIR)
         os.makedirs(state, exist_ok=True)
@@ -1733,6 +1761,9 @@ class Hub:
             self.update_meta(self.issue(ref), lambda m: None, desc=desc)
         if lane is not None:
             new = self.lane(lane)
+            if state != "proposed" and new != self.lane_of(issue):
+                self.require_approver(issue, "move an approved task to another lane")
+                self.require_approver_lane(new, "move an approved task into that lane")
             for lab in issue["labels"]:
                 if lab.startswith(LANE_PREFIX):
                     self.tracker.remove_label(issue["number"], lab)
@@ -1997,7 +2028,11 @@ class Hub:
             self.warnings.append(f"The worktree has uncommitted changes ({', '.join(dirty[:5])}); commit them so "
                                  "reviewers and the branch see them.")
         checks, checks_line = [], ""
-        if (self.config.get("checks") or {}).get("run"):
+        gated = (self.config.get("checks") or {}).get("run") and self.kind_of(issue) not in DECISION_KINDS
+        if gated and not wt and not skip_checks and not self.actor.human and (self.config.get("checks") or {}).get("block", True):
+            raise SignalboxError(f"{tid} cannot be finished without its checks, and they run in its worktree: claim it "
+                                 f"with one (`{command('claim ' + tid)}`), or ask a person to finish it")
+        if gated:
             if skip_checks:
                 self.require_human("finish without the checks")
                 checks_line = f"Checks: skipped by {self.actor.label}"
@@ -2410,6 +2445,9 @@ class Hub:
                 self._link_deps(n, sorted(set(old_deps) - set(new_deps)), on=False)
                 done.append(f"edited {t['id']}")
             if t.get("group") != o.get("group"):
+                if self.state_of(issue) != "proposed":  # approved work keeps the approvers it was approved by
+                    self.require_approver(issue, "move an approved task to another lane")
+                    self.require_approver_lane(lanes.get(t.get("group")), "move an approved task into that lane")
                 for lab in issue["labels"]:
                     if lab.startswith(LANE_PREFIX):
                         self.tracker.remove_label(n, lab)
@@ -3238,6 +3276,8 @@ def add_lane(hub, name, prefix=None, owners=(), wip=None):
     hub.tracker.ensure_label(LANE_PREFIX + name, "14b8a6", lane_description(lane))
     if owners:
         path = hub.project.config_path
+        if not path:
+            raise SignalboxError(f"Lane owners go into {STATE_DIR}/{CONFIG_FILE}; add them in the repository's main checkout")
         cfg = json.loads(K.read_text_file(path))
         entry = {"name": name, "prefix": pid, "owners": owners}
         if wip:
@@ -3621,23 +3661,50 @@ def guard_event(hub, event):
     if not issue_raw or not sender:
         return None
     issue = GitHubTracker._issue(issue_raw)
-    if MARK not in issue["labels"]:
+    label = (event.get("label") or {}).get("name")
+    if MARK not in issue["labels"] and not (action == "unlabeled" and label == MARK):
         return None
     n = issue["number"]
     tracker = hub.tracker
     labels = set(issue["labels"])
-    label = (event.get("label") or {}).get("name")
     agents = hub.team
     present = [LABEL_STATES[x] for x in labels if x in LABEL_STATES]
     prev = max(present, key=K.STATES.index) if present else "proposed"
     sl = STATE_LABELS
+    is_open = issue["state"] == "open"
+    shown = prev if is_open else ("done" if issue.get("state_reason") == "completed" else None)
+    yolo = labels & {YOLO_LABEL}
 
     def reopen():
         tracker.update_issue(n, state="open")
         tracker.add_labels(n, [sl[prev]])
 
     decision, undo = None, None
-    if action == "labeled" and label == sl["todo"] and sl["doing"] not in labels:  # with doing: a pause or handoff
+    if action == "unlabeled" and label == MARK:
+        # Taking an approved task off the board, perhaps to change it unguarded and put it back.
+        if shown not in (None, "proposed"):
+            decision, undo = "take approved work off the board", lambda: tracker.add_labels(n, [MARK])
+    elif action == "labeled" and label == MARK:
+        # Putting an issue on the board, or back: it comes as a proposal unless an approver puts it there.
+        if shown not in (None, "proposed") or yolo:
+            decision = "put approved work on the board"
+
+            def undo():
+                if not is_open:
+                    tracker.update_issue(n, state="open")
+                for lab in (labels & ({sl["todo"], sl["doing"], sl["review"]} | yolo)):
+                    tracker.remove_label(n, lab)
+                tracker.add_labels(n, [sl["proposed"]])
+    elif action == "unlabeled" and label in (sl["todo"], sl["doing"], sl["review"]) and is_open and prev == "proposed":
+        # Moves add the new state before taking the old one off, so this leaves the task a proposal: a demotion that
+        # would let a rejection pass for a withdrawal.
+        decision = "move approved work back to proposed"
+
+        def undo():
+            tracker.add_labels(n, [label])
+            if sl["proposed"] in labels:
+                tracker.remove_label(n, sl["proposed"])
+    elif action == "labeled" and label == sl["todo"] and sl["doing"] not in labels:  # with doing: a pause or handoff
         if sl["review"] in labels:
             decision, undo = "send back", lambda: tracker.remove_label(n, sl["todo"])
         else:  # from a proposal, or from no state at all
@@ -3800,8 +3867,10 @@ class SignalboxHandler(K.BoardHandler):
 
     The server acts with that person's GitHub token, so being able to reach its port must not be enough to act as
     them: not for another account on a shared machine, nor for an agent on theirs that would rather approve its own
-    work than ask. Each `serve` makes a secret key; the link it opens carries it once, the page keeps it in an
-    HttpOnly cookie, and every request without it is refused."""
+    work than ask. Each `serve` makes a secret key. The browser gets it in the URL's fragment, through a file only
+    the person can read, so it is never on a command line nor sent in a URL; the page keeps it in storage scoped to
+    this origin and sends it in a header that every request but the page itself must carry. Cookies are not used:
+    they would also go to other servers on the same host."""
 
     server_version = "Signalbox/" + VERSION
 
@@ -3814,41 +3883,27 @@ class SignalboxHandler(K.BoardHandler):
         return self._error(403, "Images are not shared through Signalbox yet: attach them to the issue on GitHub, "
                                 "and they show in its notes there")
 
-    def _cookie_name(self):
-        return f"signalbox_{self.server.server_address[1]}"
-
     def _has_key(self):
         key = getattr(self.server, "key", None)
         if not key:
             return True
-        try:
-            jar = SimpleCookie(self.headers.get("Cookie") or "")
-        except CookieError:
-            return False
-        got = jar.get(self._cookie_name())
-        return bool(got) and hmac.compare_digest(got.value.encode("utf-8", "replace"), key.encode("utf-8"))
+        got = self.headers.get("X-Signalbox-Key") or ""
+        return hmac.compare_digest(got.encode("utf-8", "replace"), key.encode("utf-8"))
+
+    def _page_request(self):
+        """The board's page itself (kanvas.html, the same for everyone), which needs no key to load."""
+        parts = self._route()
+        return self.command == "GET" and len(parts) in (1, 2) and parts[0] in self.server.hubs and \
+            (len(parts) == 1 or parts[1] in ("", "index.html"))
 
     def _gate(self):
         """Whether the request may go on; otherwise it is answered here."""
         if not self._host_allowed():
             self._error(403, "Host not allowed")
             return False
-        if self._has_key():
+        if self._page_request() or self._has_key():
             return True
-        url = urlparse(self.path)
-        given = (parse_qs(url.query).get("key") or [""])[0]
-        key = self.server.key
-        if self.command == "GET" and given and hmac.compare_digest(given.encode("utf-8", "replace"), key.encode("utf-8")):
-            cookie = f"{self._cookie_name()}={key}; Path=/; HttpOnly; SameSite=Lax"
-            self._send(302, headers={"Location": url.path or "/", "Set-Cookie": cookie})
-            return False
-        if "api" in self._route():
-            self._error(401, "This board is private: open it from the link `signalbox serve` printed")
-        else:
-            body = ("<h1>This board is private</h1><p>Open it from the link <code>signalbox serve</code> printed in "
-                    "its terminal. The link carries a key that only the person who started it has; restarting "
-                    "<code>serve</code> makes a new one.</p>")
-            self._send(401, K.page("Signalbox", body), "text/html; charset=utf-8")
+        self._error(401, "This board is private: open it from the link `signalbox serve` printed when it started")
         return False
 
     def do_GET(self):
@@ -3920,8 +3975,24 @@ class SignalboxServer(K.BoardServer):
 
     def __init__(self, *a, **kw):
         self.hubs = {}
-        self.key = secrets.token_urlsafe(24)
+        self.key = secrets.token_urlsafe(32)
         super().__init__(*a, **kw)
+
+
+def private_link(url):
+    """A file only this user can read that sends the browser to `url`, so the key in it never shows on a command
+    line (a browser is started with its address as an argument, which other accounts can read). Returns its file
+    URL and the folder to remove when serve stops."""
+    import tempfile
+    folder = tempfile.mkdtemp(prefix="signalbox-")  # 0700
+    path = os.path.join(folder, "open-board.html")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    target = json.dumps(url).replace("<", "\\u003c")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f'<!doctype html><meta charset="utf-8"><title>Signalbox</title><script>location.replace({target})</script>'
+                f'<p>Opening the board. If nothing happens, open the link that <code>signalbox serve</code> printed.</p>')
+    import pathlib
+    return pathlib.Path(path).as_uri(), folder
 
 
 def poll_hub(server, name, hub, lock, every):
@@ -3941,7 +4012,17 @@ def cmd_serve(args):
     project = Project()
     project.require_config()
     tracker = make_tracker(project, project.config)
-    hub = Hub(project, tracker, Actor(safe_whoami(tracker), True), interactive=True)
+    # The board acts as a person, with every human decision. Only a person may start it: not an agent (signed, or
+    # with an agent account's token), not a command without a terminal, not an identity GitHub did not confirm.
+    actor = resolve_actor(args, tracker, config=project.config)
+    if not actor.human:
+        raise SignalboxError("serve is a person's board: it makes human decisions as them. Agents use the CLI or "
+                             f"`{command('mcp')}`; ask the person to start the board in their own terminal.")
+    if not person_present():
+        raise SignalboxError("serve needs a person at the terminal, since the board acts as them.")
+    if not getattr(tracker, "verified", True):
+        raise SignalboxError("serve needs an identity GitHub confirms: use a token of your own account.")
+    hub = Hub(project, tracker, actor, interactive=True)
     board = hub.write_mirror()
     hosts = K.LOCAL_NAMES if args.host in ("127.0.0.1", "localhost") else None
     server, last = None, None
@@ -3959,7 +4040,7 @@ def cmd_serve(args):
     threading.Thread(target=poll_hub, args=(server, name, hub, lock, max(2, int(args.poll or project.config["poll_seconds"]))),
                      daemon=True).start()
     host, port = server.server_address[:2]
-    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '') else host}:{port}/{quote(name)}/?key={server.key}"
+    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '') else host}:{port}/{quote(name)}/#sbkey={server.key}"
     print(f"Signalbox board for {board['title']}: {len(board['tasks'])} tasks from {tracker.describe()}, "
           f"locks on {hub.locks.where()}")
     print(f"You act as {hub.actor.label} in the browser.")
@@ -3967,14 +4048,18 @@ def cmd_serve(args):
     print("The link holds this session's key: whoever has it acts as you on the board, so keep it to yourself.")
     if not server.check_host:
         print("Warning: listening beyond localhost, over plain HTTP: the key crosses the network unencrypted.")
+    folder = None
     if not args.no_open:
-        threading.Timer(0.4, webbrowser.open, (url,)).start()
+        link, folder = private_link(url)
+        threading.Timer(0.4, webbrowser.open, (link,)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
         server.server_close()
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def cmd_export(args):
@@ -4077,7 +4162,7 @@ class McpServer:
     def hub(self):
         project = Project(self.dir)
         cfg = project.require_config()
-        key = project.config_path
+        key = project.config_source
         if key not in self._trackers:  # keep the tracker, so whoami is asked once
             self._trackers[key] = make_tracker(project, cfg)
         tracker = self._trackers[key]
