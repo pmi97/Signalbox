@@ -12,7 +12,7 @@ Security review, the factory layer, and Kanvas 0.5.0 merged in.
 - Security: `serve` starts only for a verified person at a terminal, and requires a per-session key in a header; the browser gets it in the URL fragment through a private file, never on a command line, and it is never a cookie. It opens no other boards or phones and takes no image uploads.
 - Security (from a review of this release): the guard also catches tasks taken off the board or put on it approved, and demotions to proposed; a bare repository's worktrees read the config from HEAD; worktree copies never write through symlinks; approved work changes lanes only with both lanes' approvers; redirects drop the token off-host; agents cannot dodge the checks on build tasks by working without a worktree.
 - `--json` on every command; `next` (with `--claim`) dispatches the most useful ready task and survives races; `checks` gate `finish` and go into the summary, `verify` runs them; `inbox` (and `inbox --all` across repositories) shows people what waits for them.
-- `signalbox mcp`: the agent commands as MCP tools over stdio, signed with the client's name; `init` registers it for Claude Code (`.mcp.json`) and Antigravity (`.agents/mcp_config.json`).
+- `signalbox mcp`: the agent commands as MCP tools over stdio, signed with the client's name; `init` registers it for Claude Code (`.mcp.json`) and Antigravity (`.agents/mcp_config.json`). Installed once, it serves every project: it finds the workspace from the client's roots (holding calls until they come), or the agent names it with `signalbox_use_project`.
 
 ## Signalbox 0.1.0
 

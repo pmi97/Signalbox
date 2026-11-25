@@ -112,7 +112,16 @@ After `init`, both pick Signalbox up from the repository itself, so it works the
 | Tools | `.mcp.json` starts `signalbox mcp` (approve it once) | `.agents/mcp_config.json` starts `signalbox mcp` |
 | Signature | the MCP client's name (`claude-code`), or `SIGNALBOX_AGENT` | the MCP client's name, or `SIGNALBOX_AGENT` |
 
-`signalbox mcp` serves the agent commands as MCP tools (`signalbox_status`, `signalbox_next`, `signalbox_claim`, `signalbox_finish`, ...) over stdio, using only the standard library. It always acts as an agent, so no tool can approve, accept or break a lock. It finds the project from `--dir`, `$SIGNALBOX_DIR`, the client's workspace roots, or the folder it starts in. Where `python3` is not the name of Python (Windows), change `command` in those two files to `py` or `python`. Agents without MCP use the same commands through the shell, and `--json` gives them answers to parse.
+`signalbox mcp` serves the agent commands as MCP tools (`signalbox_status`, `signalbox_next`, `signalbox_claim`, `signalbox_finish`, ...) over stdio, using only the standard library. It always acts as an agent, so no tool can approve, accept or break a lock. It finds the project from `--dir` or `$SIGNALBOX_DIR`, the workspace roots the client reports (tool calls wait for them), or the folder it starts in; when none is a Signalbox project, its answer tells the agent to call `signalbox_use_project` with its workspace's path. Where `python3` is not the name of Python (Windows), change `command` in those two files to `py` or `python`. Agents without MCP use the same commands through the shell, and `--json` gives them answers to parse.
+
+**One setup for all your projects.** Install Signalbox once and register it globally; every repository with a `.signalbox/config.json` then works, whatever folder the client starts its servers in:
+
+```bash
+uv tool install git+https://github.com/pmi97/signalbox    # or pipx install; gives `signalbox`
+claude mcp add --scope user signalbox -- signalbox mcp    # Claude Code, every project
+```
+
+For Antigravity, add the same server to `~/.gemini/config/mcp_config.json`: `{"mcpServers": {"signalbox": {"command": "signalbox", "args": ["mcp"]}}}`. Antigravity documents the workspace file `.agents/mcp_config.json` too, but some versions have been reported to load only the global one. Its agents find the skill in `.agents/skills/` (its default) and read `AGENTS.md` either way. Claude Code cloud sessions use the project's `.mcp.json` and skill, since the repository is all they get.
 
 ## Running a software factory
 

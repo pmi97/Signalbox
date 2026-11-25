@@ -4144,24 +4144,61 @@ MCP_TOOLS = [
     ("signalbox_fog", "List, add to or clear a map's Not yet specified.", _schema({"map": _ID, "add": _STR, "remove": _STR}, ["map"]), False),
     ("signalbox_radar", "Work in progress that touches the same files.", _schema(), True),
     ("signalbox_whoami", "Who you act as, and for whom.", _schema(), True),
+    ("signalbox_use_project", "Point Signalbox at your workspace when it says it found no project: the path of the git "
+     "repository that has .signalbox/config.json.", _schema({"path": _STR}, ["path"]), False),
 ]
 
 
 class McpServer:
+    """The project is the first of: --dir or $SIGNALBOX_DIR, the folder an agent names with signalbox_use_project,
+    the client's workspace roots, and the folder the server started in. Clients start servers in different places
+    (some in the workspace, some in the user's home), so the server asks for the roots and holds tool calls until
+    they come, and an agent can always say where it works."""
+
     def __init__(self, agent=None, directory=None, out=None):
         self.agent = agent
         self.dir = directory
+        self.dir_from = "given" if directory else None
         self.out = out or sys.stdout
         self.client_roots = False
+        self.roots_pending = False
+        self.waiting = []
         self._trackers = {}
+
+    def ask_roots(self):
+        if self.client_roots and self.dir_from in (None, "roots"):
+            self.roots_pending = True
+            self.send({"jsonrpc": "2.0", "id": "signalbox-roots", "method": "roots/list"})
+
+    def take_roots(self, roots):
+        paths = []
+        for root in roots or []:
+            uri = urlparse(str((root or {}).get("uri") or ""))
+            if uri.scheme == "file":
+                path = urllib.request.url2pathname(uri.path)
+                if os.path.isdir(path):
+                    paths.append(path)
+        for path in paths:  # the first root that is a Signalbox project, else the first folder
+            try:
+                if Project(path).config:
+                    self.dir, self.dir_from = path, "roots"
+                    return
+            except SignalboxError:
+                continue
+        if paths and self.dir_from is None:
+            self.dir, self.dir_from = paths[0], "roots"
 
     def send(self, msg):
         self.out.write(json.dumps(msg, ensure_ascii=False) + "\n")
         self.out.flush()
 
     def hub(self):
-        project = Project(self.dir)
-        cfg = project.require_config()
+        try:
+            project = Project(self.dir)
+            cfg = project.require_config()
+        except SignalboxError as e:
+            raise SignalboxError(f"No Signalbox project in {self.dir or os.getcwd()} ({e}). Call signalbox_use_project "
+                                 "with your workspace's path: the git repository that has .signalbox/config.json.")
         key = project.config_source
         if key not in self._trackers:  # keep the tracker, so whoami is asked once
             self._trackers[key] = make_tracker(project, cfg)
@@ -4170,8 +4207,14 @@ class McpServer:
         return Hub(project, tracker, actor, interactive=False)
 
     def call(self, name, a):
-        hub = self.hub()
         a = a or {}
+        if name == "signalbox_use_project":
+            project = Project(os.path.abspath(os.path.expanduser(str(a["path"]))))
+            cfg = project.require_config()
+            self.dir, self.dir_from = project.root, "agent"
+            return {"project": project.root, "title": cfg.get("title") or project.name,
+                    "hub": make_tracker(project, cfg).describe()}
+        hub = self.hub()
         if name == "signalbox_status":
             return op_status(hub)
         if name == "signalbox_inbox":
@@ -4257,15 +4300,16 @@ class McpServer:
 
     def handle(self, msg):
         method, mid = msg.get("method"), msg.get("id")
-        if method is None:  # a response to our own request (roots/list)
-            if mid == "signalbox-roots" and isinstance(msg.get("result"), dict):
-                for root in msg["result"].get("roots") or []:
-                    uri = urlparse(str(root.get("uri") or ""))
-                    if uri.scheme == "file" and not self.dir:
-                        path = urllib.request.url2pathname(uri.path)
-                        if os.path.isdir(path):
-                            self.dir = path
-                            break
+        if method is None:  # a response to our own request (roots/list), an answer or an error
+            if mid == "signalbox-roots":
+                if isinstance(msg.get("result"), dict):
+                    self.take_roots(msg["result"].get("roots"))
+                self.roots_pending = False
+                held, self.waiting = self.waiting, []
+                for m in held:
+                    reply = self.handle(m)
+                    if reply:
+                        self.send(reply)
             return None
         params = msg.get("params") or {}
         if method == "initialize":
@@ -4278,8 +4322,10 @@ class McpServer:
                       "capabilities": {"tools": {"listChanged": False}},
                       "serverInfo": {"name": "signalbox", "version": VERSION}, "instructions": MCP_INSTRUCTIONS}
         elif method == "notifications/initialized":
-            if self.client_roots and not self.dir:
-                self.send({"jsonrpc": "2.0", "id": "signalbox-roots", "method": "roots/list"})
+            self.ask_roots()
+            return None
+        elif method == "notifications/roots/list_changed":
+            self.ask_roots()
             return None
         elif method == "ping":
             result = {}
@@ -4288,6 +4334,9 @@ class McpServer:
                                  "annotations": {"readOnlyHint": ro, "destructiveHint": False, "openWorldHint": True}}
                                 for n, d, sch, ro in MCP_TOOLS]}
         elif method == "tools/call":
+            if self.roots_pending:  # the workspace is on its way: answer once it is known
+                self.waiting.append(msg)
+                return None
             result = self.tool_result(params.get("name"), params.get("arguments") or {})
         elif str(method).startswith("notifications/"):
             return None

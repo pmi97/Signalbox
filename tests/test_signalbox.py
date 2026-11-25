@@ -895,13 +895,36 @@ class Factory(World):
         self.assertEqual(lock["label"], "claude-code (for @alice)")
 
     def test_mcp_finds_the_project_from_the_clients_roots(self):
+        self.plan()
         out = io.StringIO()
-        server = S.McpServer(agent="codex", out=out)
-        server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {}}}})
-        server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        self.assertEqual(json.loads(out.getvalue())["method"], "roots/list")
-        server.handle({"jsonrpc": "2.0", "id": "signalbox-roots", "result": {"roots": [{"uri": "file://" + self.alice}]}})
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        with mock.patch.dict(os.environ, dict(CLEAN_ENV, SIGNALBOX_USER="alice"), clear=True), chdir(elsewhere):
+            server = S.McpServer(agent="codex", out=out)
+            server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {}}}})
+            server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            # A call that comes before the roots waits for them, then runs in the project they name.
+            server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "signalbox_status", "arguments": {}}})
+            server.handle({"jsonrpc": "2.0", "id": "signalbox-roots",
+                           "result": {"roots": [{"uri": "file://" + elsewhere}, {"uri": "file://" + self.alice}]}})
+        msgs = [json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertEqual(msgs[0]["method"], "roots/list")  # handle() returns its replies; only our request was written
         self.assertEqual(server.dir, self.alice)
+        self.assertEqual((msgs[1]["id"], len(msgs[1]["result"]["structuredContent"]["tasks"])), (2, 3))
+
+    def test_mcp_agents_can_name_their_workspace(self):
+        self.plan()
+        out = io.StringIO()
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        with mock.patch.dict(os.environ, dict(CLEAN_ENV, SIGNALBOX_USER="alice"), clear=True), chdir(elsewhere):
+            server = S.McpServer(agent="antigravity", out=out)
+            lost = server.tool_result("signalbox_status", {})
+            self.assertTrue(lost["isError"])
+            self.assertIn("signalbox_use_project", lost["content"][0]["text"])
+            used = server.tool_result("signalbox_use_project", {"path": self.alice})
+            self.assertFalse(used["isError"], used)
+            self.assertEqual(len(server.tool_result("signalbox_status", {})["structuredContent"]["tasks"]), 3)
 
     def test_mcp_over_stdio_in_a_real_process(self):
         self.plan()

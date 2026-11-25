@@ -15,7 +15,7 @@ python .agents/skills/signalbox/signalbox.py <command>
 
 Use `python3` where `python` is missing. Never edit issues, labels or `refs/signalbox/*` by hand, and never edit `.signalbox/board.json`: it is a mirror the CLI rewrites.
 
-**MCP tools.** When your client lists `signalbox_*` tools (the project's `.mcp.json` or `.agents/mcp_config.json` starts `signalbox mcp`), use them instead of the shell: they are the same commands, sign with your client's name, and return JSON. Everything below applies to both; `signalbox_next`, `signalbox_claim` and the rest take the same arguments as the commands. On the shell, add `--json` to any command when you want to parse its answer.
+**MCP tools.** When your client lists `signalbox_*` tools (the project's `.mcp.json` or `.agents/mcp_config.json` starts `signalbox mcp`), use them instead of the shell: they are the same commands, sign with your client's name, and return JSON. Everything below applies to both; `signalbox_next`, `signalbox_claim` and the rest take the same arguments as the commands. If a tool answers that it found no project, call `signalbox_use_project` with the path of the repository you work in, then carry on. On the shell, add `--json` to any command when you want to parse its answer.
 
 **Sign every command** with your tool's name, so people can tell who did what: set `SIGNALBOX_AGENT=claude-code` (or `codex`, `cursor`, `gemini`, `copilot`, `opencode`) once if your shell keeps variables, or pass `--as claude-code` each time. When several agents of one tool share the board, add what each does, as in `claude-code-docs`. Without a signature you act as the person whose login runs the command, which is not what you are.
 
