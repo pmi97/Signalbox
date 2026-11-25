@@ -840,6 +840,49 @@ class Factory(World):
         self.assertEqual(len(status["tasks"]), 3)
 
 
+class KanvasFiveFeatures(World):
+    """Kanvas 0.5.0 features, mapped onto the hub: YOLO stops, who started a run, images."""
+
+    config = {"approvers": ["alice"], "agents": {"logins": ["acme-bot"]}}
+
+    def test_yolo_can_stop_before_a_task(self):
+        self.plan()  # SB-2 waits on SB-1
+        self.assertIn("cannot", self.sb("yolo", "SB-2", "stop", agent="claude-code", code=1).lower() + "cannot")
+        self.sb("yolo", "SB-2", "stop", tty=True)
+        board = K.task_map(self.board())
+        self.assertTrue(board["SB-2"]["yolo_before"])
+        self.assertEqual(K.yolo_cover(self.board()).get("SB-1"), "SB-2")
+        js = json.JSONDecoder().raw_decode(self.sb("--json", "show", "SB-2", agent="claude-code"))[0]
+        self.assertTrue(js["yolo_stop"])
+        self.sb("claim", "SB-1", "--no-worktree", agent="claude-code")
+        self.assertIn("doing -> done", self.sb("finish", "SB-1", "-m", "Designed", agent="claude-code"))
+        nxt = json.JSONDecoder().raw_decode(self.sb("--json", "next", agent="claude-code"))[0]
+        self.assertNotEqual((nxt["next"] or {}).get("id"), "SB-2")  # agents stop before it...
+        self.sb("claim", "SB-2", "--no-worktree", agent="claude-code")  # ...until a person asks for it by name
+        started = K.task_map(self.board())["SB-2"]["started"]
+        self.assertEqual(started["by"], "claude-code")
+        self.sb("yolo", "SB-3", "off", tty=True)
+
+    def test_only_approvers_move_a_yolo_stop_and_the_guard_restores_it(self):
+        self.plan()
+        hub = self.hub(user="bob", tty=True)
+        old = hub.write_mirror()
+        new = json.loads(json.dumps(old))
+        next(x for x in new["tasks"] if x["id"] == "SB-2")["yolo_before"] = True
+        hub.invalidate()
+        with self.assertRaisesRegex(S.SignalboxError, "cannot change where YOLO stops"):
+            hub.apply_board(K.parse_board(K.dumps(old)), K.parse_board(K.dumps(new)))
+        self.sb("yolo", "SB-2", "stop", tty=True)
+        hub = self.hub()
+        issue = hub.tracker.get_issue(2)
+        hub.tracker.remove_label(2, S.YOLO_STOP_LABEL)
+        raw = {"number": 2, "id": issue["id"], "title": issue["title"], "body": issue["body"], "state": "open",
+               "labels": [{"name": x} for x in issue["labels"] if x != S.YOLO_STOP_LABEL], "assignees": [], "user": {"login": "alice"}}
+        out = S.guard_event(hub, {"action": "unlabeled", "issue": raw, "label": {"name": S.YOLO_STOP_LABEL}, "sender": {"login": "acme-bot"}})
+        self.assertIn("undid remove a YOLO stop", out)
+        self.assertIn(S.YOLO_STOP_LABEL, hub.tracker.get_issue(2)["labels"])
+
+
 class GitHubSecurity(unittest.TestCase):
     def test_the_token_goes_only_to_github(self):
         with self.assertRaisesRegex(S.SignalboxError, "not a GitHub API"):
@@ -920,6 +963,10 @@ class ServerKey(World):
         self.assertIn("HttpOnly", headers["Set-Cookie"])
         self.assertEqual(self.request("GET", base + "api/board", cookie=cookie)[0], 200)
         self.assertEqual(self.request("GET", base, cookie=cookie)[0], 200)
+        # Images would stay on this computer while the notes go to GitHub: refused, with the reason.
+        status, _, body = self.request("POST", base + "api/files", cookie=cookie, body=b"\x89PNG\r\n", headers={"Content-Type": "image/png"})
+        self.assertEqual(status, 403)
+        self.assertIn(b"attach them to the issue on GitHub", body)
         # Even with the key, a Signalbox server opens no other boards and nothing to phones.
         self.assertEqual(self.request("POST", "/api/boards", cookie=cookie, body="{}", headers={"Content-Type": "application/json"})[0], 403)
         self.assertEqual(self.request("GET", base + "api/board", cookie="signalbox_1=" + self.server.key)[0], 401)

@@ -1,13 +1,13 @@
 # Signalbox guard: GitHub knows who made each change to an issue, so this workflow turns the board's human-only
 # decisions into rules. When an account that may not decide (an agent's bot account, or someone who is not an
-# approver of the task's lane) approves a proposal, sends work back, accepts or rejects it, turns YOLO on, or (for
+# approver of the task's lane) approves a proposal, sends work back, accepts or rejects it, turns YOLO on or removes a YOLO stop, or (for
 # agent accounts) rewrites an approved task, the guard undoes it and says why in a comment. Approvers and agent
 # accounts are read from .signalbox/config.json on the default branch, so a pull request cannot change them.
 name: signalbox-guard
 
 on:
   issues:
-    types: [labeled, closed, edited]
+    types: [labeled, unlabeled, closed, edited]
 
 permissions:
   issues: write

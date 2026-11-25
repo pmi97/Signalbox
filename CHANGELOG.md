@@ -2,7 +2,7 @@
 
 ## Signalbox 0.2.0
 
-Security review and the factory layer.
+Security review, the factory layer, and Kanvas 0.5.0 merged in.
 
 - Security: the GitHub token goes only to GitHub's API, identity comes from the token (not `SIGNALBOX_USER`), an agent's sponsor is the token's owner, unverified identities and agent accounts make no human decisions, and `SIGNALBOX_TEST_TTY=1` no longer fakes a person.
 - Security: the config is read from the main worktree, so a task branch cannot change approvers, hub, setup or checks; lock records' branch names and worktree paths are checked before git sees them; `worktrees.copy` stays inside the repository.
@@ -29,6 +29,15 @@ The first release of Signalbox, a fork of Kanvas 0.4.0 for teams of people and a
 - Engine hooks in Kanvas: a pluggable server handler, board names for `.signalbox/` mirrors, and `@login` people.
 
 # Kanvas (upstream)
+
+## v0.5.0 — 2026-11-09
+- Images in descriptions and notes: paste or drop one into the editor, and it is kept next to the board in `kanvas-files/`, named by a hash of its bytes, with ordinary Markdown pointing to it; click an image to see it at full size. Agents attach screenshots with `attach ID IMAGE ... [-m TEXT]`. `export` puts the images inside the snapshot, and `check` warns about images that are missing or that nothing uses. PNG, JPEG, GIF and WebP up to 10 MB; images from the web stay links
+- Preview images before creating a task, with removable thumbnails and uploads deferred until creation (#56, thanks to @JMAgundezG). New notes and note edits use the same previews and upload only when saved; cancelling before saving leaves no uploads. New-note previews stay with their task when switching tasks, and failed uploads or saves keep the draft for retry (#59)
+- Close a board from its name menu or with `kanvas close`, keeping its files and forgetting it for the next start. Closing the last board stops Kanvas. Deleted or moved board files are noticed while the server runs, even with no browser open.
+- Every start records who started the task and when, as `"started"` in the file. Cards, `status` and `show` name who started it, and an agent's `start` takes over a task the human started in the board; a task another agent started stays with that agent
+- YOLO can stop before a task: right-click a task of a YOLO chain and switch it from **Do it too** to **Stop before**, or choose **YOLO before this…**. Agents finish everything it depends on and wait, the card shows a STOP tag in a dashed ring, and the CLI marks it `(YOLO stops here)`. Stored as `"yolo_before": true`
+- Keyboard shortcuts keep working after you drag the spacing slider
+- Fixes: writes through a symlinked `kanvas.json` reach the real board, `export` handles lone surrogates, boards with wrong types and remembered boards holding `null` give clear errors, and `import` explains files that are not an Obsidian canvas
 
 ## v0.4.0 — 2026-10-27
 Kanvas runs without Obsidian. The board is a JSON file, agents use a new CLI, and you plan and review in an interactive HTML page.

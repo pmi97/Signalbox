@@ -6,7 +6,7 @@ In a railway signal box, an *interlocking* makes conflicting routes impossible: 
 
 ![Signalbox: three lanes, a Wayfinder map, interlocks held by an agent and a person, an agent waiting for an answer](img/signalbox-graph.png)
 
-Signalbox is a fork of [Kanvas](https://github.com/XMihura/Kanvas) by Mihura, which gave one person and their agents a shared, visual board. Signalbox scales it to **multiple groups of people and multiple agents at once**, and adds the planning model of Matt Pocock's [`/wayfinder`](https://github.com/mattpocock/skills/tree/main/skills/engineering/wayfinder) skill: maps, destinations, fog of war, a frontier, and decision tickets. Like Kanvas, it is plain Python 3.8+ with the standard library only, one HTML page, and no server of its own.
+Signalbox is a fork of [Kanvas](https://github.com/XMihura/Kanvas) by Mihura (tracking Kanvas 0.5.0), which gave one person and their agents a shared, visual board. Signalbox scales it to **multiple groups of people and multiple agents at once**, and adds the planning model of Matt Pocock's [`/wayfinder`](https://github.com/mattpocock/skills/tree/main/skills/engineering/wayfinder) skill: maps, destinations, fog of war, a frontier, and decision tickets. Like Kanvas, it is plain Python 3.8+ with the standard library only, one HTML page, and no server of its own.
 
 ## Why
 
@@ -135,6 +135,7 @@ done   # exit code 2: nothing is ready
 
 - **`serve`** opens the board in your browser, acting as your GitHub login. Approve, ask for changes, review, send back, reject, turn YOLO on, and reshape the plan by dragging, all as in Kanvas. Every change becomes issue operations, checked against the same rules. Cards show who holds each interlock, and the panel shows the lease, branch, worktree, issue and declared paths. Starting work happens through `claim`, never by dragging to Doing: dragging a task to Doing is refused with the command to use instead.
 - **Lanes** are teams or areas of work, with owners and an optional WIP limit (`add-lane Payments --owners bob --wip 3`, or `lanes` in the config). Owners and the global `approvers` decide for their lane, and GitHub teams work as `@org/team`.
+- **YOLO** hands a chain to the agents (`yolo ID on`); `yolo ID stop` makes it cover only what the task waits on, so agents stop before it. Kanvas's image attachments are not shared through the hub yet: attach images to the issue on GitHub.
 - **`unlock ID`** breaks a stuck lock (a person, at a terminal). `claim ID --take-over` takes over a lock whose lease ran out. `gc` releases locks of finished tasks and removes their worktrees and merged branches. `doctor` checks access and invariants.
 
 ![The task panel: who holds the interlock, the lease, branch, worktree and declared paths, next to the agent's open question](img/signalbox-panel.png)

@@ -63,6 +63,7 @@ MARK = "signalbox"                      # every Signalbox issue carries this lab
 STATE_LABELS = {"proposed": "sb:proposed", "todo": "sb:todo", "doing": "sb:doing", "review": "sb:review"}
 LABEL_STATES = {v: k for k, v in STATE_LABELS.items()}
 YOLO_LABEL = "sb:yolo"
+YOLO_STOP_LABEL = "sb:yolo-stop"  # Kanvas's yolo_before: YOLO covers what the task depends on, agents stop before it
 LOCK_LABEL = "sb:locked"
 LANE_PREFIX = "lane:"
 KIND_PREFIX = "kind:"
@@ -81,12 +82,13 @@ REF_RE = re.compile(r"^\s*(?:[A-Za-z][A-Za-z0-9]*-|#)?(\d+)\s*$")
 
 LABEL_COLORS = {
     MARK: "5b5bd6", "sb:proposed": "a855f7", "sb:todo": "3b82f6", "sb:doing": "f97316", "sb:review": "ec4899",
-    YOLO_LABEL: "eab308", LOCK_LABEL: "64748b",
+    YOLO_LABEL: "eab308", YOLO_STOP_LABEL: "a16207", LOCK_LABEL: "64748b",
 }
 LABEL_HELP = {
     MARK: "Managed by Signalbox", "sb:proposed": "Signalbox: proposed, waits for a human to approve it",
     "sb:todo": "Signalbox: approved", "sb:doing": "Signalbox: in progress, held by an interlock",
     "sb:review": "Signalbox: finished, waits for human review", YOLO_LABEL: "Signalbox: YOLO chain",
+    YOLO_STOP_LABEL: "Signalbox: YOLO covers what this waits on, and stops before it",
     LOCK_LABEL: "Signalbox: an interlock holds this task",
 }
 
@@ -1517,6 +1519,11 @@ class Hub:
                     "by": self._proposer(meta, issue), "desc": desc, "notes": notes, "sb": sb}
             if YOLO_LABEL in issue["labels"]:
                 task["yolo"] = True
+            if YOLO_STOP_LABEL in issue["labels"]:
+                task["yolo_before"] = True
+            if n in locks and self.state_of(issue) == "doing":  # who started this run is whoever holds the interlock
+                rec = locks[n][1]
+                task["started"] = {"by": rec.get("holder") or "someone", "at": rec.get("acquired") or ""}
             tasks.append(task)
         hub = {"hub": self.tracker.describe(), "me": self.actor.by, "locks": self.locks.where(), "version": VERSION}
         return {"kanvas": K.FORMAT, "title": self.config.get("title") or self.project.name, "groups": groups,
@@ -2113,18 +2120,34 @@ class Hub:
             self._close_unplanned(issue, f"Rejected by {self.actor.label}. {why}".strip())
 
     def set_yolo(self, ref, on=True):
+        """on: YOLO through the task; "stop": YOLO covers what it waits on and stops before it; off: neither."""
         issue = self.issue(ref)
-        self.require_approver(issue, "turn YOLO " + ("on" if on else "off"))
+        what = {True: "turn YOLO on", "stop": "make YOLO stop before"}.get(on, "turn YOLO off")
+        self.require_approver(issue, what)
         n = issue["number"]
-        if on:
+        before = on == "stop"
+        if before:
+            self.tracker.add_labels(n, [YOLO_STOP_LABEL])
+            if YOLO_LABEL in issue["labels"]:
+                self.tracker.remove_label(n, YOLO_LABEL)
+            on = True
+        elif on:
             self.tracker.add_labels(n, [YOLO_LABEL])
+            if YOLO_STOP_LABEL in issue["labels"]:
+                self.tracker.remove_label(n, YOLO_STOP_LABEL)
+        if on:
             board = self.board()
-            for key in K._upstream(K.task_map(board), K.task_map(board)[self.tid(n).upper()]) | {self.tid(n).upper()}:
-                t = K.task_map(board).get(key)
-                if t and t["state"] == "proposed":
+            tasks, me = K.task_map(board), self.tid(n).upper()
+            for key in K._upstream(tasks, tasks[me]) | {me}:
+                t = tasks.get(key)
+                # As in Kanvas: a task YOLO stops before keeps its state, and so do other stops in the chain.
+                if not t or (before if key == me else K.yolo_stop(t)):
+                    continue
+                if t["state"] == "proposed":
                     self.set_state(self.issue(t["sb"]["issue"]), "todo")
         else:
             self.tracker.remove_label(n, YOLO_LABEL)
+            self.tracker.remove_label(n, YOLO_STOP_LABEL)
         self.invalidate()
 
     def unlock(self, ref, why=""):
@@ -2368,12 +2391,12 @@ class Hub:
                 if deps:
                     self.update_meta(self.issue(n), lambda m, deps=deps: m.__setitem__("deps", deps))
                     self._link_deps(n, deps)
-                if t.get("yolo"):
-                    self.tracker.add_labels(n, [YOLO_LABEL])
+                if (t.get("yolo") or t.get("yolo_before")) and self.may_decide(lanes.get(t.get("group"))):
+                    self.tracker.add_labels(n, [YOLO_LABEL if t.get("yolo") else YOLO_STOP_LABEL])
                 continue
             same_notes = [(x.get("cid"), x.get("text")) for x in t.get("notes", [])] == \
                 [(x.get("cid"), x.get("text")) for x in o.get("notes", [])]
-            if same_notes and all(t.get(f) == o.get(f) for f in ("title", "desc", "deps", "group", "yolo", "state")):
+            if same_notes and all(t.get(f) == o.get(f) for f in ("title", "desc", "deps", "group", "yolo", "yolo_before", "state")):
                 continue  # untouched: no need to ask the hub about it
             issue = self.issue(n)
             if t["title"] != o["title"]:
@@ -2397,6 +2420,10 @@ class Hub:
                 self.require_approver(issue, "change YOLO")
                 (self.tracker.add_labels(n, [YOLO_LABEL]) if t.get("yolo") else self.tracker.remove_label(n, YOLO_LABEL))
                 done.append(f"YOLO {'on' if t.get('yolo') else 'off'} {t['id']}")
+            if bool(t.get("yolo_before")) != bool(o.get("yolo_before")):
+                self.require_approver(issue, "change where YOLO stops")
+                (self.tracker.add_labels(n, [YOLO_STOP_LABEL]) if t.get("yolo_before") else self.tracker.remove_label(n, YOLO_STOP_LABEL))
+                done.append(f"YOLO {'stops before' if t.get('yolo_before') else 'no longer stops before'} {t['id']}")
             old_notes = {x.get("cid"): x for x in o.get("notes", []) if x.get("cid")}
             kept = set()
             for note in t.get("notes", []):
@@ -2615,6 +2642,10 @@ def task_json(board, t, full=False):
         out["hitl"] = True
     if t["id"].upper() in cover:
         out["yolo"] = cover[t["id"].upper()]
+    if K.yolo_stop(t):
+        out["yolo_stop"] = True
+    if t.get("started"):
+        out["started"] = t["started"]
     if sb.get("lock"):
         out["lock"] = sb["lock"]
     if sb.get("paths"):
@@ -2721,6 +2752,8 @@ def candidates(hub, board, lane=None, kind=None, map_ref=None, pair=None):
             continue
         if sb["kind"] in HITL_KINDS and not hub.actor.human and hub.config["agents"].get("hitl_needs_pair", True) and not pair:
             continue
+        if K.yolo_stop(t) and not hub.actor.human:
+            continue  # YOLO stops before it: an agent takes it only when a person asks, by claiming it by name
         assignees = [login_of(a) for a in sb.get("assignees") or []]
         if assignees and me not in assignees:
             continue  # handed off to someone else
@@ -3282,8 +3315,8 @@ def cmd_reject(args):
 
 def cmd_yolo(args):
     hub = open_hub(args)
-    hub.set_yolo(args.id, args.state == "on")
-    print(f"YOLO {args.state} for {hub.tid(number_of(args.id))}")
+    hub.set_yolo(args.id, "stop" if args.state == "stop" else args.state == "on")
+    print(f"YOLO stops before {hub.tid(number_of(args.id))}" if args.state == "stop" else f"YOLO {args.state} for {hub.tid(number_of(args.id))}")
 
 
 def cmd_unlock(args):
@@ -3619,6 +3652,8 @@ def guard_event(hub, event):
                 tracker.add_labels(n, [sl["proposed"]])
     elif action == "labeled" and label == YOLO_LABEL:
         decision, undo = "turn YOLO on", lambda: tracker.remove_label(n, YOLO_LABEL)
+    elif action == "unlabeled" and label == YOLO_STOP_LABEL and issue["state"] == "open":  # lets YOLO run through it
+        decision, undo = "remove a YOLO stop", lambda: tracker.add_labels(n, [YOLO_STOP_LABEL])
     elif action == "closed" and issue.get("state_reason") == "completed":
         via = None
         if sl["doing"] in labels:  # an agent finishing under YOLO closes its task itself
@@ -3771,7 +3806,13 @@ class SignalboxHandler(K.BoardHandler):
     server_version = "Signalbox/" + VERSION
 
     def _may_manage(self):
-        return False  # a Signalbox board opens no other boards and is not opened to phones
+        return False  # a Signalbox board opens no other boards, closes none, and is not opened to phones
+
+    def _upload_image(self, board):
+        # Kanvas keeps images next to its board file; a Signalbox board's notes live on GitHub, where nobody else
+        # could see a file kept on this computer. Until images go to the hub, say so instead of breaking them.
+        return self._error(403, "Images are not shared through Signalbox yet: attach them to the issue on GitHub, "
+                                "and they show in its notes there")
 
     def _cookie_name(self):
         return f"signalbox_{self.server.server_address[1]}"
@@ -4348,7 +4389,7 @@ def build_parser():
     p.add_argument("-m", "--message")
     p = add("yolo", cmd_yolo, "hand a chain to the agents: everything it depends on skips review")
     p.add_argument("id")
-    p.add_argument("state", choices=["on", "off"])
+    p.add_argument("state", choices=["on", "off", "stop"], help="stop: YOLO covers what it waits on and stops before it")
     p = add("unlock", cmd_unlock, "release a lock (your own; a person may break anyone's)")
     p.add_argument("id")
     p.add_argument("-m", "--message")
