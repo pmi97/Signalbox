@@ -198,6 +198,31 @@ def number_of(ref):
     return int(m.group(1))
 
 
+def write_file(path, text):
+    """Atomically replace `path`, never through a symbolic link: not the file's (it is replaced as a name), nor its
+    folder's (refused). Kanvas's own writer follows links on purpose, for a linked board file; Signalbox's files sit in
+    task worktrees and `.signalbox/` folders, where a branch anyone can push to may have put links."""
+    folder = os.path.dirname(os.path.abspath(path))
+    if os.path.islink(folder):
+        raise SignalboxError(f"Refusing to write into {folder}: it is a symbolic link")
+    tmp = os.path.join(folder, f".{os.path.basename(path)}.{os.getpid()}-{threading.get_ident()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        for _ in range(40):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # Windows refuses to replace a file another process is reading
+                time.sleep(0.05)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        raise
+
+
 def run(cmd, cwd=None, check=True, input=None, env=None):
     """Run a command; return stdout. Raises SignalboxError with stderr on failure when `check`."""
     try:
@@ -296,6 +321,8 @@ class Project:
 
     def state_path(self, *parts):
         d = os.path.join(self.main, STATE_DIR)
+        if os.path.islink(d):
+            raise SignalboxError(f"{d} is a symbolic link; Signalbox keeps its local state only in a real folder")
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, *parts)
 
@@ -408,7 +435,7 @@ class FileTracker:
         with K.locked(self.path):
             data = self._read()
             out = fn(data)
-            K.write_text_atomic(self.path, json.dumps(data, indent=1, ensure_ascii=False) + "\n")
+            write_file(self.path, json.dumps(data, indent=1, ensure_ascii=False) + "\n")
         return out
 
     def _issue(self, data, number):
@@ -1122,10 +1149,20 @@ class Worktrees:
                         warnings.append(f"Skipped copying {rel_path}: its folder in the worktree leads outside it")
                         continue
                     shutil.copy2(src, dst)
+        # The brief and env go into the worktree's .signalbox/, which the task's branch could have made a link, or
+        # filled with links, to files anywhere: replace links, never write through them.
         state = os.path.join(path, STATE_DIR)
+        if os.path.islink(state) or (os.path.lexists(state) and not os.path.isdir(state)):
+            os.remove(state)
+            warnings.append(f"The branch had {STATE_DIR} as a link or file; replaced it with a folder")
         os.makedirs(state, exist_ok=True)
-        K.write_text_atomic(os.path.join(state, "TASK.md"), brief)
-        K.write_text_atomic(os.path.join(state, "env"), "".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()))
+        if os.path.realpath(state) != os.path.join(os.path.realpath(path), STATE_DIR):
+            raise SignalboxError(f"{state} leads outside the worktree; Signalbox writes nothing there")
+        for name, text in (("TASK.md", brief), ("env", "".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()))):
+            if os.path.isdir(os.path.join(state, name)) and not os.path.islink(os.path.join(state, name)):
+                warnings.append(f"Skipped writing {STATE_DIR}/{name}: the branch has a folder there")
+                continue
+            write_file(os.path.join(state, name), text)
         setup = (self.cfg.get("setup") or "").strip()
         if setup:
             p = subprocess.run(setup, shell=True, cwd=path, env={**os.environ, **{k: str(v) for k, v in env.items()}},
@@ -1427,8 +1464,8 @@ class Hub:
 
     def _save_disk_cache(self, data):
         try:
-            K.write_text_atomic(self.project.state_path("cache.json"), json.dumps(data, ensure_ascii=False))
-        except OSError:
+            write_file(self.project.state_path("cache.json"), json.dumps(data, ensure_ascii=False))
+        except (OSError, SignalboxError):
             pass
 
     @staticmethod
@@ -1868,6 +1905,12 @@ class Hub:
             raise SignalboxError(f"{tid} is a proposal; a person must approve it before anyone starts it")
         if vs not in ("todo", "doing"):
             raise SignalboxError(f"{tid} cannot be claimed: it is {vs}")
+        if STATE_LABELS["proposed"] in issue["labels"] and vs != "todo" or \
+                vs == "doing" and not self.locks.get(n)[0] and not (self.actor.human and self.interactive):
+            # In doing with no interlock, or still marked proposed: labels changed outside Signalbox, which may be an
+            # approval no one made. A person looks at it first.
+            raise SignalboxError(f"{tid} is in doing with no interlock, or still marked proposed: its labels were changed "
+                                 "outside Signalbox. A person moves it back to todo, or claims it themselves.")
         if kind in HITL_KINDS and not self.actor.human and self.config["agents"].get("hitl_needs_pair", True) and not pair:
             raise SignalboxError(f"{tid} is a {kind} ticket: it is resolved with a person, live. Claim it with "
                                  f"--with @their-login once they are in the conversation with you.")
@@ -2029,7 +2072,8 @@ class Hub:
                                  "reviewers and the branch see them.")
         checks, checks_line = [], ""
         gated = (self.config.get("checks") or {}).get("run") and self.kind_of(issue) not in DECISION_KINDS
-        if gated and not wt and not skip_checks and not self.actor.human and (self.config.get("checks") or {}).get("block", True):
+        if gated and not wt and not skip_checks and not (self.actor.human and self.interactive) and \
+                (self.config.get("checks") or {}).get("block", True):
             raise SignalboxError(f"{tid} cannot be finished without its checks, and they run in its worktree: claim it "
                                  f"with one (`{command('claim ' + tid)}`), or ask a person to finish it")
         if gated:
@@ -2179,6 +2223,9 @@ class Hub:
                 if not t or (before if key == me else K.yolo_stop(t)):
                     continue
                 if t["state"] == "proposed":
+                    if not self.may_decide(self.lane(t["sb"]["lane"]) if t["sb"].get("lane") else None):
+                        self.warnings.append(f"{t['id']} stays a proposal: approving it is up to its lane's approvers")
+                        continue
                     self.set_state(self.issue(t["sb"]["issue"]), "todo")
         else:
             self.tracker.remove_label(n, YOLO_LABEL)
@@ -2555,7 +2602,7 @@ class Hub:
         except OSError:
             current = None
         if text != current:
-            K.write_text_atomic(path, text)
+            write_file(path, text)
         return board
 
 
@@ -2590,7 +2637,7 @@ def task_flags(t, tasks, cover):
     if sb.get("lock"):
         lock = sb["lock"]
         out += f"  🔒 {lock.get('label')}" + (" (lease expired)" if lock.get("expired") else "")
-    out += K.yolo_mark(t, cover) + K.waiting_mark(t) + K.changes_mark(t, cover)
+    out += K.yolo_mark(t, cover) + K.waiting_mark(team_view(t)) + K.changes_mark(team_view(t), cover)
     return out
 
 
@@ -2657,6 +2704,15 @@ def print_rows(rows, tasks, cover, indent="  "):
 # ---------------------------------------------------------------------------
 
 
+def team_view(t):
+    """The task as its team wrote it: notes from outside the team cannot ask, answer, request changes or send work
+    back, however they are worded."""
+    notes = t.get("notes") or []
+    if not any(n.get("external") for n in notes):
+        return t
+    return dict(t, notes=[n for n in notes if not n.get("external")])
+
+
 def sent_back(t):
     """The feedback a task was sent back with, while it waits to be picked up again."""
     for note in reversed(t.get("notes") or []):
@@ -2670,6 +2726,7 @@ def sent_back(t):
 def task_json(board, t, full=False):
     tasks, cover = K.task_map(board), K.yolo_cover(board)
     sb = t.get("sb") or {}
+    team = team_view(t)
     state = K.view_state(t, tasks)
     out = {"id": t["id"], "title": t["title"], "state": state, "kind": sb.get("kind", "build"), "lane": sb.get("lane"),
            "map": f"{board_prefix(board)}-{sb['map']}" if sb.get("map") else None, "issue": sb.get("issue"),
@@ -2690,13 +2747,13 @@ def task_json(board, t, full=False):
         out["paths"] = sb["paths"]
     if sb.get("assignees"):
         out["assignees"] = sb["assignees"]
-    q = K.open_question(t)
+    q = K.open_question(team)
     if q:
         out["question"] = K.question_text(q)
-    cr = K.change_request(t) if t["id"].upper() not in cover else None
+    cr = K.change_request(team) if t["id"].upper() not in cover else None
     if cr:
         out["changes_requested"] = K.change_text(cr)
-    back = sent_back(t) if state == "todo" else None
+    back = sent_back(team) if state == "todo" else None
     if back:
         out["sent_back"] = back
     if sb.get("external"):
@@ -2796,7 +2853,7 @@ def candidates(hub, board, lane=None, kind=None, map_ref=None, pair=None):
         if assignees and me not in assignees:
             continue  # handed off to someone else
         rows.append(t)
-    rows.sort(key=lambda t: (not sent_back(t), t["id"].upper() not in cover, me not in [login_of(a) for a in t["sb"].get("assignees") or []],
+    rows.sort(key=lambda t: (not sent_back(team_view(t)), t["id"].upper() not in cover, me not in [login_of(a) for a in t["sb"].get("assignees") or []],
                              -weight.get(t["id"].upper(), 0), t["sb"]["issue"]))
     return rows
 
@@ -2855,7 +2912,7 @@ def op_inbox(hub):
             out["approve"].append(task_json(board, t))
         elif state == "review" and decides(t):
             out["review"].append(task_json(board, t))
-        if K.open_question(t) and (mine or not lock):
+        if K.open_question(team_view(t)) and (mine or not lock):
             out["questions"].append(task_json(board, t))
         if state == "todo" and me in [login_of(a) for a in sb.get("assignees") or []] and not lock:
             out["handed_to_you"].append(task_json(board, t))
@@ -3283,7 +3340,7 @@ def add_lane(hub, name, prefix=None, owners=(), wip=None):
         if wip:
             entry["wip"] = wip
         cfg.setdefault("lanes", []).append(entry)
-        K.write_text_atomic(path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+        write_file(path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
         hub.config["lanes"].append(entry)
         lane["config"] = K.rel(path)
     hub._labels = None
@@ -3357,6 +3414,7 @@ def cmd_yolo(args):
     hub = open_hub(args)
     hub.set_yolo(args.id, "stop" if args.state == "stop" else args.state == "on")
     print(f"YOLO stops before {hub.tid(number_of(args.id))}" if args.state == "stop" else f"YOLO {args.state} for {hub.tid(number_of(args.id))}")
+    warn(hub)
 
 
 def cmd_unlock(args):
@@ -3679,8 +3737,23 @@ def guard_event(hub, event):
         tracker.update_issue(n, state="open")
         tracker.add_labels(n, [sl[prev]])
 
-    decision, undo = None, None
-    if action == "unlabeled" and label == MARK:
+    decision, undo, allowed = None, None, None
+    if action in ("labeled", "unlabeled") and str(label or "").startswith(LANE_PREFIX) and is_open and prev != "proposed":
+        # Approved work keeps the approvers it was approved by: it leaves a lane, or enters one, only with theirs.
+        lane = next((x for x in hub.lanes() if x["label"] == label), None)
+        allowed = hub.approvers_for_lane(lane)
+        if action == "labeled":
+            decision, undo = f"move approved work into lane {label[len(LANE_PREFIX):]}", lambda: tracker.remove_label(n, label)
+        else:
+            decision, undo = f"move approved work out of lane {label[len(LANE_PREFIX):]}", lambda: tracker.add_labels(n, [label])
+    elif action == "labeled" and label == sl["doing"] and (sl["proposed"] in labels or not labels & {sl["todo"], sl["review"]}):
+        # A claim adds doing next to todo; doing on a proposal starts work no one approved.
+        decision = "start a proposal"
+
+        def undo():
+            tracker.remove_label(n, sl["doing"])
+            tracker.add_labels(n, [sl["proposed"]])
+    elif action == "unlabeled" and label == MARK:
         # Taking an approved task off the board, perhaps to change it unguarded and put it back.
         if shown not in (None, "proposed"):
             decision, undo = "take approved work off the board", lambda: tracker.add_labels(n, [MARK])
@@ -3752,11 +3825,14 @@ def guard_event(hub, event):
             decision, undo = "change an approved task", lambda: tracker.update_issue(n, **fixes)
     if not decision:
         return None
-    allowed = hub.approvers_for(issue)
-    if sender not in agents and (not allowed or sender in allowed):
+    if allowed is None:
+        allowed = hub.approvers_for(issue)
+    # Someone outside the team can close the issues they opened; on the board that would be a decision.
+    outsider = sender == login_of(issue.get("user")) and is_external(issue, agents)
+    if sender not in agents and not outsider and (not allowed or sender in allowed):
         return None
     undo()
-    who = "an agent account" if sender in agents else "not an approver here"
+    who = "an agent account" if sender in agents else "outside the team" if outsider else "not an approver here"
     allowed_txt = people(allowed) or "a person"
     tracker.add_comment(n, render_note(f"Undid **{decision}** by @{sender}, who is {who}. That decision belongs to "
                                        f"{allowed_txt}.", Actor("signalbox-guard", False), "event"))
@@ -3791,10 +3867,10 @@ def cmd_init(args):
 
     def create(rel_path, text):
         path = os.path.join(root, rel_path)
-        if os.path.exists(path):
+        if os.path.lexists(path):
             return False
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        K.write_text_atomic(path, text)
+        write_file(path, text)
         made.append(rel_path)
         return True
 
@@ -3807,8 +3883,19 @@ def cmd_init(args):
                 raise SignalboxError("No GitHub origin here; name the repository: --hub github:owner/name")
         hub = {"type": "github", "repo": repo} if repo else {"type": "file", "path": ".signalbox/hub.json"}
         prefix = (args.prefix or K.suggest_prefix(project.name, [])).upper()
+        approvers = [login_of(a) for a in args.approvers or []]
+        if not approvers and repo:
+            # With no approvers, anyone who can label issues decides; start with the person who sets the board up.
+            try:
+                gh = GitHubTracker(repo)
+                me = gh.whoami()
+                if gh.verified:
+                    approvers = [me]
+                    print(f"Approvers: @{me}. Add the people who approve and accept work to \"approvers\" in {STATE_DIR}/{CONFIG_FILE}.")
+            except SignalboxError:
+                pass
         cfg = {"signalbox": FORMAT, "title": args.title or project.name, "prefix": prefix, "hub": hub,
-               "approvers": [login_of(a) for a in args.approvers or []], "teams": {},
+               "approvers": approvers, "teams": {},
                "lanes": [], "agents": DEFAULT_CONFIG["agents"], "locks": DEFAULT_CONFIG["locks"],
                "worktrees": DEFAULT_CONFIG["worktrees"], "paths": "warn", "poll_seconds": 15}
         create(cfg_rel, json.dumps(cfg, indent=2) + "\n")
@@ -3962,7 +4049,7 @@ class SignalboxHandler(K.BoardHandler):
                 extra = {k: v for k, v in new.items() if k not in ("kanvas", "title", "groups", "tasks", "signalbox")}
                 if extra:
                     board.update(extra)
-                    K.write_text_atomic(path, K.dumps(board))
+                    write_file(path, K.dumps(board))
             with open(path, "rb") as f:
                 data = f.read()
         if error:
@@ -4575,7 +4662,7 @@ def build_parser():
     p.add_argument("--hub", help="github, github:owner/name, or file (default: github when origin is on GitHub)")
     p.add_argument("--prefix", help="task ID prefix (default: from the repository name)")
     p.add_argument("--title")
-    p.add_argument("--approvers", nargs="+", metavar="LOGIN", help="people who approve and accept (default: anyone)")
+    p.add_argument("--approvers", nargs="+", metavar="LOGIN", help="people who approve and accept (default on GitHub: you)")
     p.add_argument("--no-mcp", action="store_true", help="do not add the MCP server to .mcp.json and .agents/mcp_config.json")
     return parser
 
