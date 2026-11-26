@@ -1003,6 +1003,124 @@ class GuardVerifyAgain(World):
         self.assertEqual(bot.get_issue(n)["body"], "alice's text")
 
 
+class GuardVerifyThird(World):
+    """The third verification of the guard: each scenario as the reviewer wrote it."""
+
+    config = {"approvers": ["alice"], "agents": {"logins": ["acme-bot"]}}
+    as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
+    bot = dict(user="acme-bot", agent="claude-code")
+    POISON = "<!-- signalbox:meta {\"deps\":" + "[" * 25000 + "]" * 25000 + "} -->"
+
+    def gh(self):
+        return self.hub(user="github-actions[bot]")
+
+    def test_deeply_nested_json_crashes_nothing(self):
+        self.sb("propose", "Docs", "Agent's own", **self.bot)
+        self.sb("propose", "Docs", "Someone else's", **self.bot)
+        t = self.as_("acme-bot")
+        clean = t.get_issue(1)["body"]
+        t.update_issue(1, body="x\n\n" + self.POISON)
+        self.assertIn("SB-1", self.sb("status"))  # the board reads it, as a body with no meta
+        t.add_labels(1, ["sb:todo"])  # a self-approval, then the poison cleaned away
+        t.update_issue(1, body=clean)
+        self.assertIn("undid approve by @acme-bot", self.guard(1, "edited", sender="acme-bot"))
+        t.add_labels(2, ["sb:todo"])
+        out, errors = S.guard_sweep(self.gh())
+        self.assertEqual(errors, [])
+        self.assertTrue(any("#2" in o for o in out))
+        self.assertEqual(S.split_body("<!-- signalbox:note " + "{" * 30000 + " -->"), ("<!-- signalbox:note " + "{" * 30000 + " -->", {}))
+        note = S.parse_note({"id": 1, "user": "x", "body": "<!-- signalbox:note {\"by\":" + "[" * 9000 + "]" * 9000 + "} -->\nhi"})
+        self.assertEqual(note["by"], "@x")
+        self.assertEqual(S.Interlock._record("lock\n\n" + "[" * 30000), {})
+
+    def test_a_link_made_before_the_chain_reached_it_stays(self):
+        self.sb("propose", "Docs", "Head", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("yolo", "SB-1", "on", tty=True)
+        self.sb("propose", "Docs", "X", **self.bot)
+        self.sb("propose", "Docs", "Y", **self.bot)
+        self.sb("depend", "SB-2", "SB-3", **self.bot)  # X is in no chain yet
+        self.sb("depend", "SB-1", "SB-2", tty=True)  # then alice links X into the chain
+        self.assertIsNone(self.guard(2, label="sb:proposed"))
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(2)["body"])[1]["deps"], [3])
+
+    def test_closes_over_and_over_cost_a_run_little(self):
+        n = self.approved("Target")
+        self.sb("claim", f"SB-{n}", "--no-worktree", **self.bot)
+        t = self.as_("acme-bot")
+        for _ in range(15):
+            t.update_issue(n, state="closed", state_reason="completed")
+            t.update_issue(n, state="open")
+        calls = {"body_revisions": 0, "list_events": 0}
+        reals = {k: getattr(S.FileTracker, k) for k in calls}
+
+        def counting(k):
+            def f(self_, *a, **kw):
+                calls[k] += 1
+                return reals[k](self_, *a, **kw)
+            return f
+        with mock.patch.object(S.FileTracker, "body_revisions", counting("body_revisions")), \
+                mock.patch.object(S.FileTracker, "list_events", counting("list_events")):
+            self.guard(n, label="sb:doing")
+        self.assertLessEqual(max(calls.values()), 3)
+
+    def test_yolo_from_another_lanes_owner_does_not_skip_this_lanes_review(self):
+        cfg_path = os.path.join(self.alice, ".signalbox", "config.json")
+        cfg = json.loads(read(cfg_path))
+        cfg["lanes"].append({"name": "Ops", "prefix": "OP", "owners": ["dave"]})
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        sh("git", "commit", "-qam", "Ops lane", cwd=self.alice)
+        self.sb("propose", "Docs", "Docs work", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("propose", "Ops", "Ops head", **self.bot)
+        self.sb("approve", "SB-2", at=self.alice, user="dave", tty=True)
+        self.sb("depend", "SB-2", "SB-1", user="dave", tty=True)
+        self.sb("yolo", "SB-2", "on", user="dave", tty=True)
+        self.sb("claim", "SB-1", "--no-worktree", **self.bot)
+        out = self.sb("finish", "SB-1", "-m", "Done", **self.bot)
+        self.assertIn("doing -> review", out)
+        self.assertEqual(self.state("SB-1"), "review")
+        t = self.as_("acme-bot")  # straight on GitHub too: the guard does not count dave's YOLO for Docs
+        t.add_labels(1, ["sb:doing"])
+        self.guard(1, label="sb:doing")
+
+    def test_an_agent_cannot_send_its_own_work_back(self):
+        n = self.approved()
+        self.sb("claim", f"SB-{n}", "--no-worktree", **self.bot)
+        t = self.as_("acme-bot")
+        t.add_labels(n, ["sb:review"])  # finishing, keeping doing for now
+        t.add_labels(n, ["sb:todo"])
+        t.remove_label(n, "sb:review")
+        t.remove_label(n, "sb:doing")
+        self.assertIn("undid send back by @acme-bot", self.guard(n, "unlabeled", "sb:doing"))
+        self.assertEqual(self.state(f"SB-{n}"), "review")
+
+    def test_the_sweep_reads_the_repository_feed_not_every_timeline(self):
+        spec = {"tasks": [{"title": f"Task {i}", "lane": "Docs"} for i in range(30)]}
+        self.sb("batch", stdin=json.dumps(spec), **self.bot)
+        for i in range(30):
+            self.as_("carol").create_issue(f"Not on the board {i}", "", [])
+        calls = {"list_events": 0}
+        real = S.FileTracker.list_events
+
+        def counting(self_, *a, **kw):
+            calls["list_events"] += 1
+            return real(self_, *a, **kw)
+        data = json.loads(read(self.hub_path))
+        for n, issue in data["issues"].items():  # yesterday's, all of them
+            issue["updated_at"] = "2020-01-01T00:00:00Z"
+            for e in data.get("events", {}).get(n, []):
+                e["created_at"] = "2020-01-01T00:00:00Z"
+        with open(self.hub_path, "w") as f:
+            json.dump(data, f)
+        self.as_("acme-bot").add_labels(5, ["sb:todo"])
+        with mock.patch.object(S.FileTracker, "list_events", counting):
+            out, errors = S.guard_sweep(self.gh())
+        self.assertEqual((errors, len(out)), ([], 1))
+        self.assertLessEqual(calls["list_events"], 3)
+
+
 class Security(World):
     """Each test pins down a hole that was open: who may act as whom, what text agents trust, what reaches git."""
 

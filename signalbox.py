@@ -19,6 +19,7 @@ Python 3.8+, standard library only. `python signalbox.py -h` lists the commands.
 import argparse
 import copy
 import fnmatch
+import functools
 import getpass
 import hmac
 import io
@@ -77,7 +78,6 @@ HITL_KINDS = ("grilling", "prototype")
 
 MAP_SECTIONS = ("Destination", "Notes", "Decisions so far", "Not yet specified", "Out of scope")
 # The meta block is usually last, but people and bots append to issue bodies, so it is found anywhere.
-META_RE = re.compile(r"[ \t]*<!-- signalbox:meta (\{.*?\}) -->[ \t]*", re.S)
 NOTE_RE = re.compile(r"\A<!-- signalbox:note (\{.*?\}) -->\n?", re.S)
 REF_RE = re.compile(r"^\s*(?:[A-Za-z][A-Za-z0-9]*-|#)?(\d+)\s*$")
 
@@ -171,6 +171,17 @@ def dumps_meta(meta):
     return json.dumps(meta, sort_keys=True, separators=(",", ":"), ensure_ascii=False).replace(">", "\\u003e")
 
 
+def safe_json(text, limit=65536):
+    """Parse JSON that someone else wrote, or None: too long, malformed, or nested deep enough to exhaust the parser
+    (RecursionError) are all just unreadable."""
+    if not isinstance(text, str) or len(text) > limit:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+
+
 def clean_meta(meta):
     """The meta block with every known field of the type readers expect; anyone can write an issue body."""
     if not isinstance(meta, dict):
@@ -191,19 +202,28 @@ def clean_meta(meta):
     return out
 
 
+META_OPEN = "<!-- signalbox:meta {"
+
+
 def split_body(body):
-    """(description, meta) of an issue body."""
-    body = (body or "").replace("\r\n", "\n")
-    found = list(META_RE.finditer(body))
-    if not found:
-        return body.strip(), {}
-    m = found[-1]
-    try:
-        meta = json.loads(m.group(1))
-    except ValueError:
-        meta = {}
-    desc = re.sub(r"\n{3,}", "\n\n", (body[:m.start()].rstrip() + "\n\n" + body[m.end():].lstrip()).strip())
-    return desc, clean_meta(meta)
+    """(description, meta) of an issue body. The meta block is the last one with an end, found from the end in
+    linear time: issue bodies are anyone's to write, as large and as odd as they like."""
+    desc, meta_json = _split_body(body or "")
+    return desc, json.loads(meta_json)
+
+
+@functools.lru_cache(maxsize=2048)
+def _split_body(body):
+    body = body.replace("\r\n", "\n")
+    start = body.rfind(META_OPEN)
+    while start >= 0 and body.find("} -->", start) < 0:
+        start = body.rfind(META_OPEN, 0, start)
+    if start < 0:
+        return body.strip(), "{}"
+    end = body.find("} -->", start)
+    meta = safe_json(body[start + len(META_OPEN) - 1:end + 1])
+    desc = re.sub(r"\n{3,}", "\n\n", (body[:start].rstrip() + "\n\n" + body[end + 5:].lstrip()).strip())
+    return desc, json.dumps(clean_meta(meta if isinstance(meta, dict) else {}))
 
 
 def join_body(desc, meta):
@@ -471,6 +491,12 @@ class FileTracker:
     def list_events(self, number):
         return [dict(e) for e in self._read().get("events", {}).get(str(number), [])]
 
+    def repo_events(self, since):
+        out = []
+        for n, evs in self._read().get("events", {}).items():
+            out += [dict(e, issue=int(n)) for e in evs if (e.get("created_at") or "") >= since]
+        return sorted(out, key=lambda e: e.get("id") or 0)
+
     def body_revisions(self, number):
         """Every version of the issue's body, oldest first, with who wrote it (GitHub's edit history)."""
         return [dict(r) for r in self._read().get("revisions", {}).get(str(number), [])]
@@ -502,8 +528,9 @@ class FileTracker:
                      "state": "open", "state_reason": None, "assignees": list(assignees), "user": self.whoami(),
                      "created_at": stamp, "updated_at": stamp, "url": f"{self.describe()}#{n}"}
             data["issues"][str(n)] = issue
+            data["event_seq"] = data.get("event_seq", 0) + 1  # a version has its own place in the sequence
             data.setdefault("revisions", {})[str(n)] = [{"at": stamp, "editor": self.whoami(), "body": body,
-                                                         "seq": data.get("event_seq", 0)}]
+                                                         "seq": data["event_seq"]}]
             for lab in issue["labels"]:
                 self._event(data, n, "labeled", label=lab, birth=True)
             return dict(issue)
@@ -524,8 +551,9 @@ class FileTracker:
             if before["title"] != issue["title"]:
                 self._event(data, number, "renamed", rename={"from": before["title"], "to": issue["title"]})
             if before["body"] != issue["body"]:
+                data["event_seq"] = data.get("event_seq", 0) + 1  # a version has its own place in the sequence
                 data.setdefault("revisions", {}).setdefault(str(number), []).append(
-                    {"at": iso(now()), "editor": self.whoami(), "body": issue["body"], "seq": data.get("event_seq", 0)})
+                    {"at": iso(now()), "editor": self.whoami(), "body": issue["body"], "seq": data["event_seq"]})
             self._touch(issue)
             return dict(issue)
         return self._tx(fn)
@@ -898,6 +926,21 @@ class GitHubTracker:
             return None
         return out
 
+    def repo_events(self, since):
+        """Label, close, reopen and rename events across the repository since `since`, newest pages first."""
+        out, url = [], f"/repos/{self.repo}/issues/events?per_page=100"
+        while url:
+            payload, headers = self.call("GET", url)
+            for e in payload or []:
+                if (e.get("created_at") or "") < since:
+                    return out
+                if isinstance(e.get("issue"), dict) and "pull_request" not in e["issue"]:
+                    out.append({"event": e.get("event"), "issue": e["issue"].get("number"),
+                                "label": (e.get("label") or {}).get("name"), "created_at": e.get("created_at")})
+            m = re.search(r'<([^>]+)>;\s*rel="next"', headers.get("Link") or headers.get("link") or "")
+            url = m.group(1) if m else None
+        return out
+
     def search_issues(self, q):
         payload, _ = self.call("GET", f"/search/issues?q={quote(q)}&per_page=100")
         return [i for i in (payload or {}).get("items", []) if "pull_request" not in i]
@@ -963,10 +1006,7 @@ class Interlock:
 
     @staticmethod
     def _record(message):
-        try:
-            rec = json.loads(message.split("\n\n", 1)[1])
-        except (IndexError, ValueError):
-            return {}
+        rec = safe_json(message.split("\n\n", 1)[1]) if "\n\n" in message else None
         return rec if isinstance(rec, dict) else {}  # anyone with push access writes lock refs
 
     def _local_table(self, prefix):
@@ -1378,10 +1418,8 @@ def parse_note(comment, team=frozenset()):
     body = (comment.get("body") or "").replace("\r\n", "\n")
     m = NOTE_RE.match(body)
     if m:
-        try:
-            head = json.loads(m.group(1))
-        except ValueError:
-            head = {}
+        head = safe_json(m.group(1), 8192)
+        head = head if isinstance(head, dict) else {}
         rest = body[m.end():]
         if rest.startswith("**"):
             rest = rest.split("\n", 1)[1] if "\n" in rest else ""
@@ -1972,6 +2010,18 @@ class Hub:
         self._link_deps(n, targets)
         return targets
 
+    def yolo_reaches(self, via, issue):
+        """Whether whoever gave the YOLO task `via` its YOLO (or stop) may decide in `issue`'s lane."""
+        grant = None
+        for e in self.tracker.list_events(number_of(via)):
+            if e.get("event") == "labeled" and e.get("label") in (YOLO_LABEL, YOLO_STOP_LABEL) and \
+                    login_of(e.get("actor")) not in TRUSTED_BOTS:
+                grant = login_of(e.get("actor"))
+        if not grant:
+            return True  # no history to tell (an old hub): as before
+        allowed = self.approvers_for_lane(self.lane_of(issue))
+        return not allowed or grant in allowed
+
     def in_yolo_chain(self, issue):
         board = self.board(with_notes=False, locks=False)
         return self.tid(issue["number"]).upper() in K.yolo_cover(board) or \
@@ -2241,6 +2291,10 @@ class Hub:
         pushed = self.push_branch(rec)
         board = self.board()
         via = K.yolo_cover(board).get(tid.upper())
+        if via and via.upper() != tid.upper() and not self.yolo_reaches(via, issue):
+            self.warnings.append(f"YOLO on {via} was turned on by someone who does not decide in this task's lane, so it "
+                                 "goes to review")
+            via = None
         to = "done" if via and via.upper() != tid.upper() else "review"
         text = summary.strip()
         if checks_line:
@@ -3454,7 +3508,7 @@ def cmd_batch(args):
     text = K.read_text_file(args.file) if args.file else sys.stdin.buffer.read().decode("utf-8-sig")
     try:
         spec = json.loads(text)
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:
         raise SignalboxError(f"Batch is not valid JSON: {e}")
     res = op_batch(hub, spec)
     if want_json(args):
@@ -3912,7 +3966,7 @@ def guard_issues(hub):
 
 def guard_fresh(hub):
     """Forget what a run read, after the guard has changed the hub."""
-    for key in ("_guard_issues", "_guard_events"):
+    for key in ("_guard_issues", "_guard_events", "_guard_revisions", "_guard_memo"):
         hub.__dict__.pop(key, None)
     hub.invalidate()
 
@@ -3922,6 +3976,14 @@ def legit_approved(legit):
     if legit["open"]:
         return board_state(legit["labels"]) != "proposed"
     return legit["reason"] == "completed" or legit.get("closed_from") not in (None, "proposed")
+
+
+def guard_revisions(hub, n):
+    """An issue's edit history, read once per guard run."""
+    cache = hub.__dict__.setdefault("_guard_revisions", {})
+    if n not in cache:
+        cache[n] = hub.tracker.body_revisions(n)
+    return cache[n]
 
 
 def guard_events(hub, n):
@@ -3955,7 +4017,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
     sl = STATE_LABELS
     lanes_now = {x["label"]: x for x in hub.lanes()}
     order = [x["label"] for x in hub.lanes()]
-    legit = {"labels": set(), "open": True, "reason": None, "closed_from": None, "marks": []}
+    legit = {"labels": set(), "open": True, "reason": None, "closed_from": None, "marks": [], "grants": {}}
     violations = []
     created = parse_iso(issue.get("created_at"))
     author = login_of(issue.get("user"))
@@ -3998,7 +4060,8 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
         reason = e.get("state_reason") or "completed"
         if actor not in TRUSTED_BOTS:  # the guard's own corrections stand
             if kind == "labeled":
-                if label == sl["todo"] and sl["doing"] not in labels:  # with doing: a pause or handoff
+                if label == sl["todo"] and (sl["doing"] not in labels or sl["review"] in labels):
+                    # with doing alone: a pause or handoff; next to review it is a send-back, doing or not
                     decision = "send back" if sl["review"] in labels else "approve" if cur == "proposed" else None
                 elif label == sl["doing"] and not (sl["todo"] in labels and sl["proposed"] not in labels):
                     decision = "start work no one approved"  # a claim moves todo to doing
@@ -4017,6 +4080,8 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
                 if label in (sl["todo"], sl["doing"], sl["review"]) and is_open and cur != "proposed" and \
                         board_state(labels - {label}) == "proposed":  # moves add the new state before taking the old off
                     decision = "move approved work back to proposed"
+                elif label == sl["review"] and is_open and cur == "review" and board_state(labels - {label}) != "review":
+                    decision = "take work out of review"  # accepting closes first; a send-back adds todo first
                 elif label == YOLO_STOP_LABEL and is_open:
                     decision = "remove a YOLO stop"
                 elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
@@ -4039,7 +4104,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
                         pass  # YOLO stops before it: a person reviews it, whatever is marked
                     elif yolo_marked(events, e):
                         decision = None
-                    elif depth == 0 and yolo_covered_at(hub, issue["number"], t, e.get("id")):
+                    elif depth == 0 and yolo_covered_at(hub, issue["number"], t, e.get("id"), lane=lane):
                         decision = None
                         legit["marks"].append(e)
             elif kind == "closed" and cur != "proposed":  # withdrawing a proposal is anyone's; rejecting approved work is not
@@ -4052,8 +4117,11 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
             continue
         if kind == "labeled":
             labels.add(label)
+            if label in (YOLO_LABEL, YOLO_STOP_LABEL) and actor not in TRUSTED_BOTS:
+                legit["grants"][label] = (actor, t)
         elif kind == "unlabeled":
             labels.discard(label)
+            legit["grants"].pop(label, None) if actor not in TRUSTED_BOTS else None
         elif kind == "closed":
             if is_open:
                 legit["closed_from"] = cur
@@ -4063,46 +4131,63 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
     return legit, violations
 
 
-def yolo_covered_at(hub, n, when, event_id=None, depth=0):
-    """Whether YOLO covered task `n` when it was closed: a YOLO task (or a stop) that waits on it carried its label
-    legitimately just before the close and had not gone to review. Only tasks labelled YOLO are looked at, closed
-    ones included, so the check costs a timeline or two, whatever an agent links."""
+def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None):
+    """Whether YOLO covered task `n` at a moment (just before a close, or a version of a body): a YOLO task, or a
+    stop, that waits on it carried its label legitimately then, had not gone to review, and was given YOLO by
+    someone who may decide in `n`'s lane. The links counted are those its permitted authors left (at depth 0) or
+    those the bodies held then (at depth 1). The verdict is kept for the rest of the run."""
+    memo = hub.__dict__.setdefault("_guard_memo", {})
+    key = ("cover", n, event_id, when, depth, (lane or {}).get("label"))
+    if key in memo:
+        return memo[key]
     issues = {i["number"]: i for i in guard_issues(hub)}
-    deps = {m: [d for d in split_body(i["body"])[1].get("deps") or [] if d in issues] for m, i in issues.items()}
-    heads = [i for i in issues.values() if {YOLO_LABEL, YOLO_STOP_LABEL} & set(i["labels"])]
     me = hub.tid(n).upper()
-
-    def graph():
-        tasks = [{"id": hub.tid(m), "title": "", "state": "todo", "deps": [hub.tid(d) for d in ds]} for m, ds in deps.items()]
-        return tasks, {t["id"].upper(): t for t in tasks}
-    tasks, index = graph()
-    # The links on the way from a YOLO task down to this one count only as their permitted authors left them: an
-    # agent account cannot pull work into a chain by editing a body.
-    on_path = set()
-    for head in heads:
-        t = index.get(hub.tid(head["number"]).upper())
-        if t and me in K._upstream(index, t):
-            on_path |= {x for x in K._upstream(index, t) | {t["id"].upper()} if me in K._upstream(index, index[x]) or x == t["id"].upper()}
-    if not depth:
-        for m in [m for m in deps if hub.tid(m).upper() in on_path]:
-            deps[m] = [d for d in legit_deps(hub, issues[m]) if d in issues]
-    tasks, index = graph()
-    for head in heads:
-        t = index.get(hub.tid(head["number"]).upper())
-        if not t or me not in K._upstream(index, t):
+    # The YOLO tasks and stops that held their label legitimately then, and who gave it; nothing else can cover.
+    heads = {}
+    for i in issues.values():
+        if not {YOLO_LABEL, YOLO_STOP_LABEL} & set(i["labels"]) or i["number"] == n:
             continue
-        legit, _ = guard_replay(hub, head, guard_events(hub, head["number"]), depth=1,
+        legit, _ = guard_replay(hub, i, guard_events(hub, i["number"]), depth=1,
                                 until=None if isinstance(event_id, int) else when, before=event_id)
         state = board_state(legit["labels"], legit["open"], legit["reason"])
-        if state is None:
-            continue
-        t["state"] = state
-        if YOLO_LABEL in legit["labels"]:
-            t["yolo"] = True
-        if YOLO_STOP_LABEL in legit["labels"]:
-            t["yolo_before"] = True
-    via = K.yolo_cover({"kanvas": K.FORMAT, "title": "", "groups": [], "tasks": list(index.values())}).get(me)
-    return bool(via and via.upper() != me)
+        if state is not None and {YOLO_LABEL, YOLO_STOP_LABEL} & legit["labels"]:
+            heads[i["number"]] = (legit, state)
+    covered = False
+    if heads:
+        deps = {m: [d for d in split_body(i["body"])[1].get("deps") or [] if d in issues] for m, i in issues.items()}
+
+        def index():
+            return {hub.tid(m).upper(): {"id": hub.tid(m), "title": "", "state": "todo", "deps": [hub.tid(d) for d in ds]}
+                    for m, ds in deps.items()}
+        idx = index()
+        on_path = set()
+        for h in heads:
+            t = idx[hub.tid(h).upper()]
+            if me in K._upstream(idx, t):
+                on_path |= {x for x in K._upstream(idx, t) if me in K._upstream(idx, idx[x])} | {t["id"].upper()}
+        for m in [m for m in deps if hub.tid(m).upper() in on_path]:
+            got = legit_deps(hub, issues[m]) if not depth else deps_at(hub, issues[m], when, event_id)
+            deps[m] = [d for d in got if d in issues]
+        idx = index()
+        for h, (legit, state) in heads.items():
+            t = idx[hub.tid(h).upper()]
+            t["state"] = state
+            if YOLO_LABEL in legit["labels"]:
+                t["yolo"] = True
+            if YOLO_STOP_LABEL in legit["labels"]:
+                t["yolo_before"] = True
+        via = K.yolo_cover({"kanvas": K.FORMAT, "title": "", "groups": [], "tasks": list(idx.values())}).get(me)
+        if via and via.upper() != me:
+            head = number_of(via)
+            grant = heads[head][0]["grants"].get(YOLO_LABEL) or heads[head][0]["grants"].get(YOLO_STOP_LABEL)
+            if grant:
+                actor, granted = grant
+                rules = hub.at(granted)
+                covered = guard_permitted(rules, actor, lane, issues.get(n) or {"user": ""}, past=rules is not hub)
+            else:
+                covered = True
+    memo[key] = covered
+    return covered
 
 
 def body_walk(hub, issue, events, steps, depth=0):
@@ -4113,7 +4198,7 @@ def body_walk(hub, issue, events, steps, depth=0):
         """Where to cut the timeline for a version: after the events before it (by the file hub's sequence), or,
         on GitHub, before its second, so a change in the same second as a chain's start is not counted against it."""
         if isinstance(seq, int):
-            return {"before": seq + 1}
+            return {"before": seq}
         return {"until": t - timedelta(seconds=1)} if t else {}
 
     def approved_at(t, seq=None):
@@ -4127,7 +4212,7 @@ def body_walk(hub, issue, events, steps, depth=0):
         cut = then(t, seq)
         own = guard_replay(hub, issue, events, depth=1, **cut)[0]["labels"]
         return bool({YOLO_LABEL, YOLO_STOP_LABEL} & own) or \
-            yolo_covered_at(hub, issue["number"], cut.get("until") or t, event_id=cut.get("before"), depth=1)
+            yolo_covered_at(hub, issue["number"], cut.get("until") or t, event_id=cut.get("before"), depth=1, lane=None)
 
     undone = []
     lane = hub.lane_of(issue)
@@ -4171,12 +4256,32 @@ def body_walk(hub, issue, events, steps, depth=0):
 def legit_deps(hub, issue):
     """An issue's dependencies as their permitted authors left them, from GitHub's edit history; without the
     history, the ones it has now."""
-    current = split_body(issue["body"])[1].get("deps") or []
-    revisions = hub.tracker.body_revisions(issue["number"])
-    if not revisions or len(revisions) < 2:
-        return current
-    steps = [(r.get("body"), login_of(r.get("editor")), parse_iso(r.get("at")), r.get("seq")) for r in revisions]
-    return body_walk(hub, issue, guard_events(hub, issue["number"]), steps, depth=1)[1].get("deps") or []
+    memo = hub.__dict__.setdefault("_guard_memo", {})
+    key = ("legit_deps", issue["number"])
+    if key not in memo:
+        current = split_body(issue["body"])[1].get("deps") or []
+        revisions = guard_revisions(hub, issue["number"])
+        if not revisions or len(revisions) < 2:
+            memo[key] = current
+        else:
+            steps = [(r.get("body"), login_of(r.get("editor")), parse_iso(r.get("at")), r.get("seq")) for r in revisions]
+            memo[key] = body_walk(hub, issue, guard_events(hub, issue["number"]), steps, depth=1)[1].get("deps") or []
+    return memo[key]
+
+
+def deps_at(hub, issue, when=None, seq=None):
+    """An issue's dependencies as its body held them at a moment, from its edit history; without it, its own now."""
+    revisions = guard_revisions(hub, issue["number"]) or []
+    found = None
+    for r in revisions:
+        if isinstance(seq, int) and isinstance(r.get("seq"), int):
+            if r["seq"] >= seq:
+                break
+        elif when and (parse_iso(r.get("at")) or when) >= when:
+            break
+        found = r
+    body = found.get("body") if found else (issue["body"] if not revisions else revisions[0].get("body"))
+    return split_body(body)[1].get("deps") or []
 
 
 def guard_texts(hub, issue, events, edit=None):
@@ -4201,7 +4306,7 @@ def guard_texts(hub, issue, events, edit=None):
         if title is not None and title != issue["title"]:
             fixes["title"] = title
     # Descriptions: every version with its author when GitHub's edit history can be read; else the one edit in hand.
-    revisions = hub.tracker.body_revisions(n)
+    revisions = guard_revisions(hub, n)
     steps = []
     if revisions:
         steps = [(r.get("body"), login_of(r.get("editor")), parse_iso(r.get("at")), r.get("seq")) for r in revisions]
@@ -4304,13 +4409,18 @@ def guard_sweep(hub, days=1):
     left, the sweep puts right. Returns (undone, errors); one issue's trouble never stops the others."""
     since = iso(now() - timedelta(days=days))
     out, errors = [], []
-    for issue in hub.tracker.list_issues(None, since=since):
-        if (issue.get("updated_at") or "") < since:
-            continue
+    # Board issues changed lately, and any issue whose labels or state changed lately (one taken off the board is
+    # no board issue any more), from the repository's event feed rather than one timeline per issue.
+    numbers = {i["number"] for i in hub.tracker.list_issues(MARK, since=since) if (i.get("updated_at") or "") >= since}
+    for e in hub.tracker.repo_events(since):
+        if e.get("event") in ("closed", "reopened", "renamed") or guard_managed(e.get("label")):
+            numbers.add(e["issue"])
+    for n in sorted(numbers):
         try:
-            done = guard_reconcile(hub, issue["number"])
-        except SignalboxError as e:
-            errors.append(f"#{issue['number']}: {e}")
+            done = guard_reconcile(hub, n)
+        except Exception as e:  # one issue's trouble, whatever it is, never stops the others
+            errors.append(f"#{n}: {type(e).__name__}: {e}")
+            guard_fresh(hub)
             continue
         if done:
             out.append(done)
@@ -4925,7 +5035,7 @@ class McpServer:
                 continue
             try:
                 msg = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 self.send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
                 continue
             for m in msg if isinstance(msg, list) else [msg]:
