@@ -589,7 +589,9 @@ class Guard(World):
         self.sb("note", "SB-1", "Halfway", **bot)
         self.sb("yolo", "SB-2", "on", tty=True)
         self.assertIn("doing -> done", self.sb("finish", "SB-1", "-m", "Done", **bot))
+        self.assertEqual(self.guard(1, "closed"), "marked #1 done under YOLO")  # the verdict, kept for good
         self.assertIsNone(self.guard(1, "closed"))
+        self.assertIn(S.YOLO_DONE_LABEL, self.labels(1))
         self.assertEqual(self.state("SB-1"), "done")
         self.sb("claim", "SB-2", "--no-worktree", **bot)
         self.sb("finish", "SB-2", "-m", "Done", **bot)
@@ -710,7 +712,8 @@ class Guard(World):
     def test_the_sweep_puts_right_what_no_run_judged(self):
         n = self.approved()
         self.as_("acme-bot").add_labels(n, ["sb:yolo"])  # its run failed or was cancelled
-        out = S.guard_sweep(self.hub(user="github-actions[bot]"))
+        out, errors = S.guard_sweep(self.hub(user="github-actions[bot]"))
+        self.assertEqual(errors, [])
         self.assertTrue(any("turn YOLO on" in o for o in out))
         self.assertNotIn("sb:yolo", self.labels(n))
 
@@ -729,6 +732,166 @@ class Guard(World):
         desc, meta = S.split_body(after["body"])
         self.assertEqual((desc, meta["deps"]), ("Cover install and upgrade", [2]))
         self.assertIsNone(self.guard(1, "edited", sender="alice", changes={"title": {"from": "x"}}))
+
+
+class GuardVerify(World):
+    """Holes the verification of the rebuilt guard found, each pinned down with the reviewer's scenario."""
+
+    config = {"approvers": ["alice"], "agents": {"logins": ["acme-bot"]}}
+    as_, guard, labels, approved, _age_events = Guard.as_, Guard.guard, Guard.labels, Guard.approved, Guard._age_events
+
+    def gh(self):
+        return self.hub(user="github-actions[bot]")
+
+    def test_rewrites_made_off_the_board_or_never_judged_are_put_back(self):
+        self.sb("propose", "Docs", "Base", "Original description", agent="claude-code")
+        self.sb("propose", "Docs", "Other", agent="claude-code")
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("depend", "SB-1", "SB-2", tty=True)
+        bot = self.as_("acme-bot")
+        bot.remove_label(1, "signalbox")
+        bot.update_issue(1, title="Do nothing", body=S.join_body("Skip it", {"by": "claude-code"}))  # its run never ran
+        bot.add_labels(1, ["signalbox"])
+        self.assertIsNotNone(self.guard(1, label="signalbox"))
+        after = bot.get_issue(1)
+        self.assertEqual((after["title"], S.split_body(after["body"])[0]), ("Base", "Original description"))
+        self.assertEqual(S.split_body(after["body"])[1]["deps"], [2])
+        # A rewrite whose own run was cancelled: the next run on any label puts it back.
+        bot.update_issue(1, title="Renamed", body="rewritten")
+        self.as_("carol").add_labels(1, ["bug"])
+        self.assertIn("undid", self.guard(1, label="bug"))
+        self.assertEqual(bot.get_issue(1)["title"], "Base")
+
+    def chain_with_a_proposal(self):
+        self.sb("propose", "Docs", "Head", agent="claude-code")
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("yolo", "SB-1", "on", tty=True)
+        self.sb("propose", "Docs", "Later idea", agent="claude-code")
+        self.sb("depend", "SB-1", "SB-2", tty=True)  # an approver links a proposal into the chain
+        self.sb("propose", "Docs", "Unrelated approved work", agent="claude-code")
+        self.sb("approve", "SB-3", tty=True)
+        bot = self.as_("acme-bot")
+        before = bot.get_issue(2)
+        d, m = S.split_body(before["body"])
+        bot.update_issue(2, body=S.join_body(d, dict(m, deps=[3])))  # the agent account links SB-3 through it
+        return before
+
+    def test_no_link_into_a_yolo_chain_through_a_proposal(self):
+        before = self.chain_with_a_proposal()
+        self.assertIn("is part of a YOLO chain", self.sb("depend", "SB-2", "SB-3", agent="claude-code", user="acme-bot", code=1))
+        self.assertIn("link work into a YOLO chain", self.guard(2, "edited", sender="acme-bot", changes={"body": {"from": before["body"]}}))
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(2)["body"])[1].get("deps", []), [])
+
+    def test_a_finish_through_a_refused_link_is_not_done_whatever_runs_first(self):
+        self.chain_with_a_proposal()  # the edit's run has not happened yet
+        bot = dict(user="acme-bot", agent="claude-code")
+        self.sb("claim", "SB-3", "--no-worktree", **bot)
+        self.assertIn("doing -> done", self.sb("finish", "SB-3", "-m", "Done", **bot))
+        self.assertIn("undid mark done", self.guard(3, "closed"))
+        self.assertNotEqual(self.state("SB-3"), "done")
+        self.assertNotIn(S.YOLO_DONE_LABEL, self.labels(3))
+
+    def yolo_finish(self):
+        self.sb("propose", "Docs", "Base", agent="claude-code")
+        self.sb("propose", "Docs", "Target", "--deps", "SB-1", agent="claude-code")
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("yolo", "SB-2", "on", tty=True)
+        bot = dict(user="acme-bot", agent="claude-code")
+        self.sb("claim", "SB-1", "--no-worktree", **bot)
+        self.sb("finish", "SB-1", "-m", "Done", **bot)
+        self.assertEqual(self.guard(1, "closed"), "marked #1 done under YOLO")
+        self.sb("claim", "SB-2", "--no-worktree", **bot)
+        self.sb("finish", "SB-2", "-m", "Done", **bot)
+
+    def test_a_yolo_finish_stands_when_the_chain_changes_later(self):
+        self.yolo_finish()
+        self.sb("reject", "SB-2", "-m", "not like this", tty=True)
+        self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+        self.assertEqual(self.state("SB-1"), "done")
+
+    def test_a_yolo_finish_stands_when_a_person_unlinks_it(self):
+        self.yolo_finish()
+        self.sb("undepend", "SB-2", "SB-1", tty=True)
+        self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+        self.assertEqual(self.state("SB-1"), "done")
+
+    def test_a_run_costs_the_same_however_many_proposals_wait_on_a_task(self):
+        n = self.approved("Target")
+        bot = dict(user="acme-bot", agent="claude-code")
+        self.sb("claim", f"SB-{n}", "--no-worktree", **bot)
+        spec = {"tasks": [{"title": f"Dependent {i}", "lane": "Docs", "deps": [f"SB-{n}"]} for i in range(60)]}
+        self.sb("batch", stdin=json.dumps(spec), **bot)
+        self.as_("acme-bot").update_issue(n, state="closed", state_reason="completed")
+        calls = []
+        real = S.FileTracker.list_events
+        with mock.patch.object(S.FileTracker, "list_events", lambda self_, number: calls.append(number) or real(self_, number)):
+            self.assertIn("undid mark done", self.guard(n, "closed"))
+        self.assertLessEqual(len(calls), 2)
+
+    def commit_config(self, change, date):
+        path = os.path.join(self.alice, ".signalbox", "config.json")
+        cfg = json.loads(read(path))
+        change(cfg)
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        env = dict(os.environ, GIT_COMMITTER_DATE=date, GIT_AUTHOR_DATE=date)
+        subprocess.run(["git", "commit", "-qam", f"config {date}"], cwd=self.alice, env=env, check=True)
+
+    def at_time(self, n, stamp):
+        data = json.loads(read(self.hub_path))
+        for e in data["events"][str(n)]:
+            e["created_at"] = stamp
+        data["issues"][str(n)]["created_at"] = stamp
+        with open(self.hub_path, "w") as f:
+            json.dump(data, f)
+
+    def test_a_blind_or_broken_config_in_history_does_not_blind_the_guard(self):
+        self.commit_config(lambda c: c.update(approvers=["acme/leads"]), "2026-03-01T00:00:00Z")
+        self.sb("propose", "Docs", "Work", agent="claude-code")
+        self.as_("alice").add_labels(1, ["sb:todo"])  # approved in the days the team could not be read
+        self.at_time(1, "2026-04-01T00:00:00Z")
+        path = os.path.join(self.alice, ".signalbox", "config.json")
+        good = read(path)
+        with open(path, "w") as f:
+            f.write(good + "\n<<<<<<< broken\n")
+        env = dict(os.environ, GIT_COMMITTER_DATE="2026-04-15T00:00:00Z", GIT_AUTHOR_DATE="2026-04-15T00:00:00Z")
+        subprocess.run(["git", "commit", "-qam", "oops"], cwd=self.alice, env=env, check=True)
+        with open(path, "w") as f:
+            f.write(good)
+        self.commit_config(lambda c: c.update(approvers=["alice"]), "2026-05-01T00:00:00Z")
+        self.as_("acme-bot").add_labels(1, ["sb:yolo"])  # today, an agent account turns YOLO on
+        self.assertIn("undid turn YOLO on by @acme-bot", self.guard(1))
+        self.assertEqual(self.state("SB-1"), "todo")
+
+    def test_done_stays_done_and_rejected_stays_rejected(self):
+        n = self.approved()
+        bot = dict(user="acme-bot", agent="claude-code")
+        self.sb("claim", f"SB-{n}", "--no-worktree", **bot)
+        self.sb("finish", f"SB-{n}", "-m", "Done", **bot)
+        self.sb("accept", f"SB-{n}", tty=True)
+        t = self.as_("acme-bot")
+        t.update_issue(n, state="open")
+        t.update_issue(n, state="closed", state_reason="not_planned")
+        self.assertIn("undid", self.guard(n, "closed"))
+        self.assertEqual((t.get_issue(n)["state"], t.get_issue(n)["state_reason"]), ("closed", "completed"))
+        m = self.approved("Rejected work")
+        self.sb("reject", f"SB-{m}", "-m", "no", tty=True)
+        t.update_issue(m, state="open")
+        self.assertIn("undid reopen closed work by @acme-bot", self.guard(m, "reopened"))
+        self.assertEqual(t.get_issue(m)["state"], "closed")
+
+    def test_the_board_cannot_link_work_into_a_yolo_chain_either(self):
+        self.sb("propose", "Docs", "Head", agent="claude-code")
+        self.sb("propose", "Docs", "Other approved", agent="claude-code")
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("yolo", "SB-1", "on", tty=True)
+        hub = self.hub(user="carol", tty=True)
+        old = hub.write_mirror()
+        new = json.loads(json.dumps(old))
+        next(x for x in new["tasks"] if x["id"] == "SB-1")["deps"] = ["SB-2"]
+        hub.invalidate()
+        with self.assertRaisesRegex(S.SignalboxError, "YOLO chain"):
+            hub.apply_board(K.parse_board(K.dumps(old)), K.parse_board(K.dumps(new)))
 
 
 class Security(World):

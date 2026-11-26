@@ -64,6 +64,7 @@ STATE_LABELS = {"proposed": "sb:proposed", "todo": "sb:todo", "doing": "sb:doing
 LABEL_STATES = {v: k for k, v in STATE_LABELS.items()}
 YOLO_LABEL = "sb:yolo"
 YOLO_STOP_LABEL = "sb:yolo-stop"  # Kanvas's yolo_before: YOLO covers what the task depends on, agents stop before it
+YOLO_DONE_LABEL = "sb:yolo-done"  # put by the guard alone, on a finish under YOLO it found legitimate when it happened
 LOCK_LABEL = "sb:locked"
 LANE_PREFIX = "lane:"
 KIND_PREFIX = "kind:"
@@ -82,13 +83,14 @@ REF_RE = re.compile(r"^\s*(?:[A-Za-z][A-Za-z0-9]*-|#)?(\d+)\s*$")
 
 LABEL_COLORS = {
     MARK: "5b5bd6", "sb:proposed": "a855f7", "sb:todo": "3b82f6", "sb:doing": "f97316", "sb:review": "ec4899",
-    YOLO_LABEL: "eab308", YOLO_STOP_LABEL: "a16207", LOCK_LABEL: "64748b",
+    YOLO_LABEL: "eab308", YOLO_STOP_LABEL: "a16207", YOLO_DONE_LABEL: "ca8a04", LOCK_LABEL: "64748b",
 }
 LABEL_HELP = {
     MARK: "Managed by Signalbox", "sb:proposed": "Signalbox: proposed, waits for a human to approve it",
     "sb:todo": "Signalbox: approved", "sb:doing": "Signalbox: in progress, held by an interlock",
     "sb:review": "Signalbox: finished, waits for human review", YOLO_LABEL: "Signalbox: YOLO chain",
     YOLO_STOP_LABEL: "Signalbox: YOLO covers what this waits on, and stops before it",
+    YOLO_DONE_LABEL: "Signalbox: done under YOLO, as the guard checked when it closed",
     LOCK_LABEL: "Signalbox: an interlock holds this task",
 }
 
@@ -878,12 +880,14 @@ class GitHubTracker:
         """The issue body's edit history from GitHub (GraphQL), oldest first, or None when it cannot be read or does
         not hold whole versions (its newest entry must be the body as it is now)."""
         q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){issue(number:$n){body author{login} "
-             "createdAt userContentEdits(last:100){nodes{editedAt editor{login} diff}}}}}")
+             "createdAt userContentEdits(last:100){totalCount nodes{editedAt editor{login} diff}}}}}")
         owner, name = self.repo.split("/", 1)
         try:
             payload, _ = self.call("POST", "/graphql", {"query": q, "variables": {"o": owner, "r": name, "n": number}})
             issue = payload["data"]["repository"]["issue"]
             nodes = list(reversed(issue["userContentEdits"]["nodes"]))  # GitHub lists the newest first
+            if issue["userContentEdits"].get("totalCount", 0) > len(nodes):
+                return None  # cut off: its oldest entry is not where the text began
         except (SignalboxError, KeyError, TypeError):
             return None
         out = [{"at": n.get("editedAt"), "editor": login_of((n.get("editor") or {}).get("login")), "body": n.get("diff") or ""}
@@ -1500,13 +1504,25 @@ class Hub:
         if sha == commits[0][1] and self.project.config_path and not self.project.linked:
             return self  # the newest committed config is the one this hub runs with
         if sha not in self._at:
-            text = git("show", f"{sha}:{rel}", cwd=self.project.root, check=False)
-            if text.returncode != 0:
-                return self
-            other = copy.copy(self)
-            other.config = load_config(f"{sha}:{rel}", text=text.stdout)
-            other.team = frozenset(login_of(x) for x in other.config["agents"].get("logins") or [])
-            self._at[sha] = other
+            # A config that cannot be read (a bad commit, a lost blob) gives way to the nearest one that can.
+            i = [h for _, h in commits].index(sha)
+            for h in [h for _, h in commits[i:]] + [h for _, h in reversed(commits[:i])]:
+                if h == commits[0][1] and self.project.config_path and not self.project.linked:
+                    self._at[sha] = self
+                    break
+                text = git("show", f"{h}:{rel}", cwd=self.project.root, check=False)
+                try:
+                    cfg = load_config(f"{h}:{rel}", text=text.stdout) if text.returncode == 0 else None
+                except SignalboxError:
+                    cfg = None
+                if cfg:
+                    other = copy.copy(self)
+                    other.config = cfg
+                    other.team = frozenset(login_of(x) for x in cfg["agents"].get("logins") or [])
+                    self._at[sha] = other
+                    break
+            else:
+                self._at[sha] = self
         return self._at[sha]
 
     def invalidate(self):
@@ -1948,15 +1964,22 @@ class Hub:
             return targets
         if self.state_of(issue) == "done":
             raise SignalboxError(f"{self.tid(n)} is done; it cannot wait on anything now")
-        board = self.board(notes=False, locks=False)
-        if (self.tid(n).upper() in K.yolo_cover(board) or YOLO_LABEL in issue["labels"] or YOLO_STOP_LABEL in issue["labels"]) \
-                and not self.may_decide(self.lane_of(issue)):
-            raise SignalboxError(f"{self.tid(n)} is part of a YOLO chain: work linked into it would skip review. Ask an "
-                                 "approver to link it.")
+        self.require_yolo_link(issue)
         self._check_deps(n, targets)
         self.update_meta(issue, lambda m: m.__setitem__("deps", sorted(set(m.get("deps", [])) | set(targets))))
         self._link_deps(n, targets)
         return targets
+
+    def in_yolo_chain(self, issue):
+        board = self.board(notes=False, locks=False)
+        return self.tid(issue["number"]).upper() in K.yolo_cover(board) or \
+            YOLO_LABEL in issue["labels"] or YOLO_STOP_LABEL in issue["labels"]
+
+    def require_yolo_link(self, issue):
+        """Work linked into a YOLO chain skips review, so only its approvers link more into it, proposals included."""
+        if self.in_yolo_chain(issue) and not self.may_decide(self.lane_of(issue)):
+            raise SignalboxError(f"{self.tid(issue['number'])} is part of a YOLO chain: work linked into it would skip "
+                                 "review. Ask an approver to link it.")
 
     def withdraw(self, refs, why=""):
         out = []
@@ -2608,6 +2631,8 @@ class Hub:
                 done.append(f"retitled {t['id']}")
             new_deps = sorted({ids.get(d.upper()) or number_of(d) for d in t.get("deps", [])})
             old_deps = sorted({number_of(d) for d in o.get("deps", [])})
+            if set(new_deps) - set(old_deps):
+                self.require_yolo_link(issue)
             if t.get("desc", "") != o.get("desc", "") or new_deps != old_deps:
                 self.update_meta(self.issue(n), lambda m, d=new_deps: m.__setitem__("deps", d), desc=t.get("desc", ""))
                 self._link_deps(n, sorted(set(new_deps) - set(old_deps)))
@@ -3846,7 +3871,7 @@ def guard_managed(label):
 
 
 class GuardBlind(SignalboxError):
-    """The guard cannot tell who may decide (a team it cannot read): it changes nothing and fails the run."""
+    """The guard cannot tell who may decide now (a team it cannot read): it changes nothing and fails the run."""
 
 
 def guard_restricted(rules, actor, issue):
@@ -3861,30 +3886,52 @@ def board_state(labels, is_open=True, reason=None):
     return max(present, key=K.STATES.index) if present else "proposed"
 
 
-def guard_permitted(hub, actor, lane, issue):
-    """Whether `actor` makes human decisions in `lane` under `hub`'s rules (those in force at the event)."""
-    if not actor or actor in hub.team or (actor == login_of(issue.get("user")) and is_external(issue, hub.team)):
+def guard_permitted(rules, actor, lane, issue, past=False):
+    """Whether `actor` makes human decisions in `lane` under `rules` (the config in force at the event). Where the
+    approvers of a past day cannot be read, that day's decisions stand; where today's cannot, the guard stops."""
+    if not actor or guard_restricted(rules, actor, issue):
         return False
-    allowed = hub.approvers_for_lane(lane)
+    allowed = rules.approvers_for_lane(lane)
     if NOBODY in allowed:
+        if past:
+            return True
         raise GuardBlind("The guard cannot read the members of a team among the approvers with this token. List them "
                          f"under \"teams\" in {STATE_DIR}/{CONFIG_FILE} (\"org/team\": [logins]); until then it changes nothing.")
     return not allowed or actor in allowed
+
+
+def guard_events(hub, n):
+    """An issue's timeline, read once per guard run."""
+    cache = hub.__dict__.setdefault("_guard_events", {})
+    if n not in cache:
+        cache[n] = hub.tracker.list_events(n)
+    return cache[n]
+
+
+def yolo_marked(events, close):
+    """Whether the guard marked this close as a finish under YOLO, before the issue was reopened."""
+    after = events[events.index(close) + 1:] if close in events else []
+    for e in after:
+        if e.get("event") == "reopened":
+            return False
+        if e.get("event") == "labeled" and e.get("label") == YOLO_DONE_LABEL and login_of(e.get("actor")) in TRUSTED_BOTS:
+            return True
+    return False
 
 
 def guard_replay(hub, issue, events, until=None, depth=0, before=None):
     """Replay an issue's whole timeline (label, close and reopen events, each with the account GitHub recorded),
     judge every change by the rules in force when it was made (`hub.at`) against the state the issue legitimately
     had then, and keep only the changes their authors may make. Returns (legit, violations): legit is {"labels",
-    "open", "reason"} as the issue would be without the refused changes; violations are [(event, decision, lane)].
+    "open", "reason", "closed_from", "marks"} as the issue would be without the refused changes, with the finishes
+    under YOLO to mark; violations are [(event, decision, lane)].
 
     The verdict on an event never changes afterwards, so any run judges the whole history the same way: a run that
     fails or is cancelled leaves its events to the next one, and no order of changes makes an approval a pause."""
     sl = STATE_LABELS
     lanes_now = {x["label"]: x for x in hub.lanes()}
     order = [x["label"] for x in hub.lanes()]
-    tid = hub.tid(issue["number"]).upper()
-    legit = {"labels": set(), "open": True, "reason": None}
+    legit = {"labels": set(), "open": True, "reason": None, "closed_from": None, "marks": []}
     violations = []
     created = parse_iso(issue.get("created_at"))
     author = login_of(issue.get("user"))
@@ -3906,7 +3953,8 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
         rules = hub.at(created)
         labels = {e.get("label") for e in birth if guard_managed(e.get("label"))}
         granted = labels & {sl["todo"], sl["doing"], sl["review"], YOLO_LABEL, YOLO_STOP_LABEL}
-        if granted and author not in TRUSTED_BOTS and not guard_permitted(rules, author, lane_in(labels, rules), issue):
+        if granted and author not in TRUSTED_BOTS and \
+                not guard_permitted(rules, author, lane_in(labels, rules), issue, past=rules is not hub):
             violations.append((birth[-1], "create approved work", lane_in(labels, rules)))
             labels -= granted
         legit["labels"] |= labels
@@ -3921,7 +3969,9 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
         labels, is_open = legit["labels"], legit["open"]
         cur = board_state(labels)
         rules = hub.at(t)
+        past = rules is not hub
         lane, decision = lane_in(labels, rules), None
+        reason = e.get("state_reason") or "completed"
         if actor not in TRUSTED_BOTS:  # the guard's own corrections stand
             if kind == "labeled":
                 if label == sl["todo"] and sl["doing"] not in labels:  # with doing: a pause or handoff
@@ -3952,15 +4002,26 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
                     decision = "change the kind of approved work"
                 elif label == MARK and is_open and cur != "proposed":
                     decision = "take approved work off the board"
-            elif kind == "closed" and is_open:
-                if (e.get("state_reason") or "completed") == "completed":
-                    covered = sl["doing"] in labels and depth == 0 and yolo_covered_at(hub, issue["number"], t, e.get("id"))
-                    decision = None if covered else "mark done"  # an agent finishing under YOLO closes its task itself
-                elif cur != "proposed":  # withdrawing a proposal is anyone's; rejecting approved work is not
-                    decision = "reject"
-            elif kind == "reopened" and not is_open and (cur != "proposed" or legit["reason"] == "completed"):
-                decision = "reopen closed work"
-        if decision and not guard_permitted(rules, actor, lane, issue):
+            elif kind == "closed" and not is_open:
+                if reason != legit["reason"]:  # done becomes rejected, or the other way round
+                    decision = "change how closed work was closed"
+            elif kind == "closed" and reason == "completed":
+                decision = "mark done"
+                if sl["doing"] in labels and not guard_permitted(rules, actor, lane, issue, past):
+                    # An agent finishing under YOLO closes its task itself. The guard checks the chain once, as it was
+                    # just before the close, and marks what it found legitimate, so later changes to the chain never
+                    # turn the verdict.
+                    if yolo_marked(events, e):
+                        decision = None
+                    elif depth == 0 and yolo_covered_at(hub, issue["number"], t, e.get("id")):
+                        decision = None
+                        legit["marks"].append(e)
+            elif kind == "closed" and cur != "proposed":  # withdrawing a proposal is anyone's; rejecting approved work is not
+                decision = "reject"
+            elif kind == "reopened" and not is_open and \
+                    (legit["reason"] == "completed" or legit["closed_from"] not in (None, "proposed")):
+                decision = "reopen closed work"  # done, or rejected after it was approved
+        if decision and not guard_permitted(rules, actor, lane, issue, past):
             violations.append((e, decision, lane))
             continue
         if kind == "labeled":
@@ -3968,50 +4029,168 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
         elif kind == "unlabeled":
             labels.discard(label)
         elif kind == "closed":
-            legit.update(open=False, reason=e.get("state_reason") or "completed")
+            if is_open:
+                legit["closed_from"] = cur
+            legit.update(open=False, reason=reason)
         elif kind == "reopened":
-            legit.update(open=True, reason=None)
+            legit.update(open=True, reason=None, closed_from=None)
     return legit, violations
 
 
 def yolo_covered_at(hub, n, when, event_id=None):
     """Whether YOLO covered task `n` when it was closed: a YOLO task (or a stop) that waits on it carried its label
-    legitimately then and had not gone to review. The chain's links are today's; agents cannot add links to a YOLO
-    chain, and the guard takes those they add on GitHub back out."""
-    board = hub.board(notes=False, locks=False)
-    tasks = K.task_map(board)
+    legitimately just before the close and had not gone to review. Only tasks labelled YOLO are looked at, closed
+    ones included, so the check costs a timeline or two, whatever an agent links."""
+    issues = {i["number"]: i for i in hub.tracker.list_issues(MARK)}
+    deps = {m: [d for d in split_body(i["body"])[1].get("deps") or [] if d in issues] for m, i in issues.items()}
+    heads = [i for i in issues.values() if {YOLO_LABEL, YOLO_STOP_LABEL} & set(i["labels"])]
     me = hub.tid(n).upper()
-    snapshot = []
-    for t in board["tasks"]:
-        t = dict(t)
-        t.pop("yolo", None)
-        t.pop("yolo_before", None)
-        if me in K._upstream(tasks, tasks[t["id"].upper()]):  # only what waits on `n` can cover it
-            other = hub.issue(t["sb"]["issue"], fresh=False)
-            # Just before the close: by event ids where GitHub gives them (one order across the repository).
-            legit, _ = guard_replay(hub, other, hub.tracker.list_events(other["number"]), depth=1,
-                                    until=None if isinstance(event_id, int) else when, before=event_id)
-            state = board_state(legit["labels"], legit["open"], legit["reason"])
-            if state is None:
-                continue
-            t["state"] = state
-            if YOLO_LABEL in legit["labels"]:
-                t["yolo"] = True
-            if YOLO_STOP_LABEL in legit["labels"]:
-                t["yolo_before"] = True
-        snapshot.append(t)
-    via = K.yolo_cover(dict(board, tasks=snapshot)).get(me)
+
+    def graph():
+        tasks = [{"id": hub.tid(m), "title": "", "state": "todo", "deps": [hub.tid(d) for d in ds]} for m, ds in deps.items()]
+        return tasks, {t["id"].upper(): t for t in tasks}
+    tasks, index = graph()
+    # The links on the way from a YOLO task down to this one count only as their permitted authors left them: an
+    # agent account cannot pull work into a chain by editing a body.
+    on_path = set()
+    for head in heads:
+        t = index.get(hub.tid(head["number"]).upper())
+        if t and me in K._upstream(index, t):
+            on_path |= {x for x in K._upstream(index, t) | {t["id"].upper()} if me in K._upstream(index, index[x]) or x == t["id"].upper()}
+    for m in [m for m in deps if hub.tid(m).upper() in on_path]:
+        deps[m] = [d for d in legit_deps(hub, issues[m]) if d in issues]
+    tasks, index = graph()
+    for head in heads:
+        t = index.get(hub.tid(head["number"]).upper())
+        if not t or me not in K._upstream(index, t):
+            continue
+        legit, _ = guard_replay(hub, head, guard_events(hub, head["number"]), depth=1,
+                                until=None if isinstance(event_id, int) else when, before=event_id)
+        state = board_state(legit["labels"], legit["open"], legit["reason"])
+        if state is None:
+            continue
+        t["state"] = state
+        if YOLO_LABEL in legit["labels"]:
+            t["yolo"] = True
+        if YOLO_STOP_LABEL in legit["labels"]:
+            t["yolo_before"] = True
+    via = K.yolo_cover({"kanvas": K.FORMAT, "title": "", "groups": [], "tasks": list(index.values())}).get(me)
     return bool(via and via.upper() != me)
 
 
-def guard_reconcile(hub, n):
-    """Replay issue `n` and put it back to what its legitimate history leaves. Returns what was undone, or None."""
+def body_walk(hub, issue, events, steps):
+    """Walk a description's versions [(body, editor, time)], keeping what each author was allowed to change: on
+    approved work, agent accounts and outsiders change neither its description nor its map nor drop its links,
+    and only approvers link more work into a YOLO chain. Returns (description, meta, what was refused)."""
+    def approved_at(t):
+        return board_state(guard_replay(hub, issue, events, until=t, depth=1)[0]["labels"]) != "proposed"
+
+    undone = []
+    chain = hub.in_yolo_chain(issue)
+    lane = hub.lane_of(issue)
+    good_desc, good_meta = split_body(steps[0][0])
+    for body, editor, t in steps[1:]:
+        r_desc, r_meta = split_body(body)
+        rules = hub.at(t)
+        approved = approved_at(t) if t else True
+        restricted = editor not in TRUSTED_BOTS and guard_restricted(rules, editor, issue)
+        if approved and restricted:
+            if r_desc != good_desc and hub.kind_of(issue) == "map":
+                # agents chart fog and scope; the destination and notes are the people's
+                for name in ("Destination", "Notes"):
+                    if section(r_desc, name) != section(good_desc, name):
+                        undone.append(f"rewrite a map's {name.lower()} by @{editor}")
+                    r_desc = set_section(r_desc, name, section(good_desc, name))
+                good_desc = r_desc
+            elif r_desc != good_desc:
+                undone.append(f"rewrite approved work by @{editor}")
+            if r_meta.get("map") != good_meta.get("map"):
+                undone.append(f"move approved work to another map by @{editor}")
+        else:
+            good_desc = r_desc
+            good_meta["map"] = r_meta.get("map")
+        old, new = set(good_meta.get("deps") or []), set(r_meta.get("deps") or [])
+        if old - new:
+            if approved and restricted:
+                undone.append(f"remove dependencies of approved work by @{editor}")
+            else:
+                old -= old - new
+        if new - old:
+            if chain and editor not in TRUSTED_BOTS and not guard_permitted(rules, editor, lane, issue, past=rules is not hub):
+                undone.append(f"link work into a YOLO chain by @{editor}")
+            else:
+                old |= new - old
+        good_meta["deps"] = sorted(old)
+        good_meta.update({k: v for k, v in r_meta.items() if k not in ("deps", "map")})
+    return good_desc, good_meta, undone
+
+
+def legit_deps(hub, issue):
+    """An issue's dependencies as their permitted authors left them, from GitHub's edit history; without the
+    history, the ones it has now."""
+    current = split_body(issue["body"])[1].get("deps") or []
+    revisions = hub.tracker.body_revisions(issue["number"])
+    if not revisions or len(revisions) < 2:
+        return current
+    steps = [(r.get("body"), login_of(r.get("editor")), parse_iso(r.get("at"))) for r in revisions]
+    return body_walk(hub, issue, guard_events(hub, issue["number"]), steps)[1].get("deps") or []
+
+
+def guard_texts(hub, issue, events, edit=None):
+    """Titles and descriptions of approved work as their permitted authors left them. Returns (fixes, undone,
+    pulled): changes to make, what they undo, and work a refused YOLO link had pulled into a chain."""
+    n = issue["number"]
+    fixes, undone, pulled = {}, [], set()
+
+    def approved_at(t):
+        return board_state(guard_replay(hub, issue, events, until=t, depth=1)[0]["labels"]) != "proposed"
+
+    # Titles: GitHub keeps every rename with its author.
+    renames = [e for e in events if e.get("event") == "renamed" and isinstance(e.get("rename"), dict)]
+    if renames:
+        title = renames[0]["rename"].get("from")
+        for e in renames:
+            actor, t = login_of(e.get("actor")), parse_iso(e.get("created_at"))
+            if actor in TRUSTED_BOTS or not guard_restricted(hub.at(t), actor, issue) or not approved_at(t):
+                title = e["rename"].get("to")
+            else:
+                undone.append(f"change the title of approved work by @{actor}")
+        if title is not None and title != issue["title"]:
+            fixes["title"] = title
+    # Descriptions: every version with its author when GitHub's edit history can be read; else the one edit in hand.
+    revisions = hub.tracker.body_revisions(n)
+    steps = []
+    if revisions:
+        steps = [(r.get("body"), login_of(r.get("editor")), parse_iso(r.get("at"))) for r in revisions]
+    elif edit and ((edit.get("changes") or {}).get("body") or {}).get("from") is not None:
+        steps = [(edit["changes"]["body"]["from"], None, None),
+                 (issue["body"], login_of((edit.get("sender") or {}).get("login")),
+                  parse_iso((edit.get("issue") or {}).get("updated_at")) or now())]
+    if len(steps) < 2:
+        return fixes, undone, pulled
+    good_desc, good_meta, walked = body_walk(hub, issue, events, steps)
+    undone += walked
+    desc, meta = split_body(issue["body"])
+    live = {i["number"] for i in hub.tracker.list_issues(MARK) if hub.state_of(i) is not None}
+    deps = sorted(d for d in good_meta.get("deps") or [] if d in live or d in (meta.get("deps") or []))
+    pulled = set(meta.get("deps") or []) - set(deps)
+    new_meta = dict(meta, deps=deps, map=good_meta.get("map"))
+    body = join_body(good_desc, new_meta)
+    if (good_desc, deps, new_meta.get("map")) != (desc, sorted(meta.get("deps") or []), meta.get("map")):
+        fixes["body"] = body
+    return fixes, undone, pulled if "body" in fixes else set()
+
+
+def guard_reconcile(hub, n, edit=None):
+    """Replay issue `n` and put its labels, state, title and description back to what its legitimate history
+    leaves. Returns what was undone, or None."""
     tracker = hub.tracker
     issue = tracker.get_issue(n)  # now, not an event's snapshot: later changes may have come meanwhile
-    events = tracker.list_events(n)
+    events = guard_events(hub, n)
+    if MARK not in issue["labels"] and not any(e.get("label") == MARK for e in events):
+        return None  # never on the board
     legit, violations = guard_replay(hub, issue, events)
-    if not violations:
-        return None
+    text_fixes, text_undone, pulled = guard_texts(hub, issue, events, edit)
     current = {x for x in issue["labels"] if guard_managed(x)}
     # Lanes follow the legitimate state only where a refused move touched them, and only with labels that still
     # exist: lanes get renamed and removed without events on their issues.
@@ -4019,129 +4198,51 @@ def guard_reconcile(hub, n):
     existing = {lab["name"] for lab in hub.labels()} | {lane["label"] for lane in hub.lanes()}
     want = {x for x in legit["labels"] if not x.startswith(LANE_PREFIX) or (x in touched and x in existing)}
     have = {x for x in current if not x.startswith(LANE_PREFIX) or x in touched}
-    add, remove = sorted(want - have), sorted(have - want)
+    add, remove = (sorted(want - have), sorted(have - want)) if violations else ([], [])
     is_open = issue["state"] == "open"
-    if not add and not remove and legit["open"] == is_open:
-        return None  # what was refused is undone already, by an earlier run
-    if legit["open"] and not is_open:
+    reopen = violations and legit["open"] and not is_open
+    close = violations and not legit["open"] and is_open
+    reason = violations and not legit["open"] and not is_open and (issue.get("state_reason") or "completed") != legit["reason"]
+    mark = legit["marks"] and not legit["open"] and YOLO_DONE_LABEL not in issue["labels"]
+    if not (add or remove or reopen or close or reason or mark or text_fixes):
+        return None  # nothing refused is left: an earlier run undid it, or there was nothing
+    if reopen:
         tracker.update_issue(n, state="open")
     for lab in add:
         tracker.add_labels(n, [lab])
     for lab in remove:
         tracker.remove_label(n, lab)
-    if not legit["open"] and is_open:
+    if close or reason:
         tracker.update_issue(n, state="closed", state_reason=legit["reason"] or "completed")
-    # Name the refused changes since the guard last corrected this issue.
+    if mark:
+        tracker.add_labels(n, [YOLO_DONE_LABEL])
+    if text_fixes:
+        tracker.update_issue(n, **text_fixes)
+    hub.__dict__.get("_guard_events", {}).pop(n, None)
     position = {id(e): i for i, e in enumerate(events)}
     fixed_at = max((i for i, e in enumerate(events) if login_of(e.get("actor")) in TRUSTED_BOTS), default=-1)
     named = [v for v in violations if position.get(id(v[0]), len(events)) > fixed_at] or violations
     lines = []
-    for e, decision, lane in named:
+    for e, decision, lane in (named if (add or remove or reopen or close or reason) else []):
         actor = login_of(e.get("actor")) or "someone"
         who = "an agent account" if actor in hub.team else \
             "outside the team" if actor == login_of(issue.get("user")) and is_external(issue, hub.team) else "not an approver here"
         lines.append(f"- **{decision}** by @{actor}, who is {who}")
-    tracker.add_comment(n, render_note("Undid what only an approver may do:\n" + "\n".join(dict.fromkeys(lines)) +
-                                       f"\n\nThose decisions belong to {people(hub.approvers_for(issue)) or 'a person'}.",
-                                       Actor("signalbox-guard", False), "event"))
-    return "; ".join(dict.fromkeys(f"undid {d} by @{login_of(e.get('actor'))} on #{n}" for e, d, _ in violations))
-
-
-def guard_edit(hub, event):
-    """Title and description changes of approved work by accounts that may not make them: put back the last
-    version a permitted author wrote. Agent accounts may not change an approved task's description, map or
-    dependencies, nor anyone but its approvers link more work into a YOLO chain."""
-    raw = event.get("issue") or {}
-    n = raw.get("number")
-    if not n:
-        return None
-    tracker = hub.tracker
-    issue = tracker.get_issue(n)
-    if MARK not in issue["labels"]:
-        return None
-    events = tracker.list_events(n)
-    edited_at = parse_iso(raw.get("updated_at")) or now()
-    sender = login_of((event.get("sender") or {}).get("login"))
-    legit_then, _ = guard_replay(hub, issue, events, until=edited_at)
-    if board_state(legit_then["labels"], legit_then["open"], legit_then["reason"]) in ("proposed", None):
-        return None  # proposals are their authors' to revise
-    rules = hub.at(edited_at)
-    agent = guard_restricted(rules, sender, issue)
-    fixes, undone = {}, []
-    # Titles: GitHub keeps every rename with its author; replay them.
-    renames = [e for e in events if e.get("event") == "renamed" and isinstance(e.get("rename"), dict)]
-    if renames:
-        title = renames[0]["rename"].get("from")
-        for e in renames:
-            actor = login_of(e.get("actor"))
-            t = parse_iso(e.get("created_at"))
-            approved = board_state(guard_replay(hub, issue, events, until=t)[0]["labels"]) != "proposed"
-            if actor in TRUSTED_BOTS or not approved or not guard_restricted(hub.at(t), actor, issue):
-                title = e["rename"].get("to")
-            else:
-                undone.append(f"change the title of approved work by @{actor}")
-        if title is not None and title != issue["title"]:
-            fixes["title"] = title
-    # Descriptions: the last version a permitted author wrote, from GitHub's edit history when it can be read.
-    desc, meta = split_body(issue["body"])
-    good_desc, good_meta = None, None
-    revisions = tracker.body_revisions(n)
-    if revisions:
-        for r in revisions:
-            t = parse_iso(r.get("at"))
-            r_desc, r_meta = split_body(r.get("body"))
-            approved = good_desc is not None and \
-                board_state(guard_replay(hub, issue, events, until=t)[0]["labels"]) != "proposed"
-            if good_desc is None or not approved or not guard_restricted(hub.at(t), login_of(r.get("editor")), issue):
-                good_desc, good_meta = r_desc, r_meta
-    elif agent and (event.get("changes") or {}).get("body", {}).get("from") is not None:
-        good_desc, good_meta = split_body(event["changes"]["body"]["from"])
-    if good_desc is not None and agent:
-        new_meta = dict(meta)
-        if hub.kind_of(issue) == "map":  # agents chart fog and scope; the destination and notes are the people's
-            for name in ("Destination", "Notes"):
-                if section(good_desc, name) != section(desc, name):
-                    desc = set_section(desc, name, section(good_desc, name))
-                    undone.append(f"rewrite a map's {name.lower()} by @{sender}")
-            good_desc = desc
-        elif good_desc != desc:
-            undone.append(f"rewrite approved work by @{sender}")
-        if good_meta.get("map") != meta.get("map"):
-            new_meta["map"] = good_meta.get("map")
-            undone.append(f"move approved work to another map by @{sender}")
-        live = {i["number"] for i in tracker.list_issues(MARK) if hub.state_of(i) is not None}
-        lost = {d for d in good_meta.get("deps") or [] if d in live} - set(meta.get("deps") or [])
-        if lost:
-            new_meta["deps"] = sorted(set(new_meta.get("deps") or []) | lost)
-            undone.append(f"remove dependencies of approved work by @{sender}")
-        good_body = join_body(good_desc, new_meta)
-        if good_body != issue["body"] and (good_desc != split_body(issue["body"])[0] or new_meta != meta):
-            fixes["body"] = good_body
-    # Links into a YOLO chain: what they bring in would skip review.
-    added = set(meta.get("deps") or []) - set((good_meta or {}).get("deps") or []) if good_meta is not None else set()
-    if not added and (event.get("changes") or {}).get("body", {}).get("from") is not None:
-        added = set(meta.get("deps") or []) - set(split_body(event["changes"]["body"]["from"])[1].get("deps") or [])
-    if added and not guard_permitted(rules, sender, hub.lane_of(issue), issue):
-        board = hub.board(notes=False, locks=False)
-        cover = K.yolo_cover(board)
-        me = hub.tid(n).upper()
-        if me in cover or YOLO_LABEL in issue["labels"] or YOLO_STOP_LABEL in issue["labels"]:
-            body = fixes.get("body", issue["body"])
-            d, m = split_body(body)
-            m["deps"] = [x for x in m.get("deps") or [] if x not in added]
-            fixes["body"] = join_body(d, m)
-            undone.append(f"link work into a YOLO chain by @{sender}")
-    if not fixes:
-        return None
-    tracker.update_issue(n, **fixes)
-    for d in sorted(added):  # what the link brought in is judged again, now without it
+    lines += [f"- {u}" for u in text_undone] if text_fixes else []
+    if lines:
+        tracker.add_comment(n, render_note("Undid what only an approver may do:\n" + "\n".join(dict.fromkeys(lines)) +
+                                           f"\n\nThose decisions belong to {people(hub.approvers_for(issue)) or 'a person'}.",
+                                           Actor("signalbox-guard", False), "event"))
+    for d in sorted(pulled):  # what a refused YOLO link pulled in is judged again, now without it
         try:
             guard_reconcile(hub, d)
         except SignalboxError:
             pass
-    tracker.add_comment(n, render_note("Undid changes only people (and for YOLO chains, approvers) may make:\n" +
-                                       "\n".join(f"- {u}" for u in dict.fromkeys(undone)), Actor("signalbox-guard", False), "event"))
-    return "; ".join(f"undid {u} on #{n}" for u in dict.fromkeys(undone))
+    done = [f"undid {d} by @{login_of(e.get('actor'))} on #{n}" for e, d, _ in violations] if (add or remove or reopen or close or reason) else []
+    done += [f"undid {u} on #{n}" for u in text_undone] if text_fixes else []
+    if mark and not done:
+        done.append(f"marked #{n} done under YOLO")
+    return "; ".join(dict.fromkeys(done)) or None
 
 
 def guard_event(hub, event):
@@ -4149,21 +4250,24 @@ def guard_event(hub, event):
     issue = event.get("issue") or {}
     if not issue.get("number"):
         return None
-    if event.get("action") == "edited":
-        return guard_edit(hub, event)
-    return guard_reconcile(hub, issue["number"])
+    return guard_reconcile(hub, issue["number"], edit=event if event.get("action") == "edited" else None)
 
 
 def guard_sweep(hub, days=7):
-    """Judge every board issue changed in the last `days`: what a failed or cancelled run left, the sweep puts right."""
+    """Judge every board issue changed in the last `days`: what a failed or cancelled run left, the sweep puts right.
+    Returns (undone, errors); one issue's trouble never stops the others."""
     since = iso(now() - timedelta(days=days))
-    out = []
+    out, errors = [], []
     for issue in hub.tracker.list_issues(MARK):
         if (issue.get("updated_at") or "") >= since:
-            done = guard_reconcile(hub, issue["number"])
+            try:
+                done = guard_reconcile(hub, issue["number"])
+            except SignalboxError as e:
+                errors.append(f"#{issue['number']}: {e}")
+                continue
             if done:
                 out.append(done)
-    return out
+    return out, errors
 
 
 def cmd_guard(args):
@@ -4171,9 +4275,11 @@ def cmd_guard(args):
     tracker = make_tracker(project, project.require_config())
     hub = Hub(project, tracker, Actor("signalbox-guard", False))
     if args.sweep:
-        out = guard_sweep(hub)
+        out, errors = guard_sweep(hub)
         print("\n".join(out) or "Nothing to undo.")
-        return 0
+        for e in errors:
+            print(f"Error: {e}", file=sys.stderr)
+        return 1 if errors else 0
     event = json.loads(K.read_text_file(args.event or os.environ.get("GITHUB_EVENT_PATH", "")))
     out = guard_event(hub, event)
     print(out or "Nothing to guard in this event.")

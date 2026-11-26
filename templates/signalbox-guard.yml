@@ -19,14 +19,16 @@ permissions:
 
 # One run per issue at a time. GitHub may drop a waiting run when a newer one queues; that loses nothing, since
 # every run replays the issue's whole history and judges each change by the rules in force when it was made.
+# Edits get runs of their own that nothing cancels, since a description's history may not be readable later.
 concurrency:
-  group: signalbox-guard-${{ github.event.issue.number || 'sweep' }}
+  group: signalbox-guard-${{ github.event.issue.number || 'sweep' }}-${{ github.event.action == 'edited' && github.run_id || 'labels' }}
   cancel-in-progress: false
 
 jobs:
   guard:
     # Also when the signalbox label itself goes, so taking a task off the board is seen too.
-    if: github.event_name == 'schedule' || contains(github.event.issue.labels.*.name, 'signalbox') || github.event.label.name == 'signalbox'
+    # Edits run whatever the labels say: an issue taken off the board is still judged as the board issue it was.
+    if: github.event_name == 'schedule' || github.event.action == 'edited' || contains(github.event.issue.labels.*.name, 'signalbox') || github.event.label.name == 'signalbox'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
