@@ -624,22 +624,95 @@ class Guard(World):
         with open(self.hub_path, "w") as f:
             json.dump(data, f)
 
-    def test_history_is_judged_once_and_returning_tasks_in_full(self):
+    def test_decisions_are_judged_by_the_rules_of_their_time(self):
         n = self.approved()
-        # Long ago, alice approved; today she is no longer an approver. Her past approval stands.
-        self._age_events(n)
-        self.as_("carol").add_labels(n, ["kind:task"])
-        with mock.patch.object(S.Hub, "approvers_for_lane", lambda hub, lane: {"bob"}):
-            out = self.guard(n)
-        self.assertIn("change the kind", out)
-        self.assertNotIn("undid approve", out)
+        self._age_events(n)  # alice approved this long ago, when she was an approver
+        cfg_path = os.path.join(self.alice, ".signalbox", "config.json")
+        cfg = json.loads(read(cfg_path))
+        cfg["approvers"] = ["bob"]
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        sh("git", "commit", "-qam", "bob approves now", cwd=self.alice)
+        self.assertIsNone(self.guard(n))  # her old approval stands
+        self.as_("alice").add_labels(n, ["sb:yolo"])  # but today she may not decide
+        self.assertIn("undid turn YOLO on by @alice", self.guard(n))
         self.assertEqual(self.state(f"SB-{n}"), "todo")
-        # An issue off the board was approved long ago by an agent account; put on the board now, all of it counts.
+        # An issue made approved long ago by an agent account, off the board until now: all of it is judged.
         t = self.as_("acme-bot").create_issue("Off the board", "", ["sb:todo"])
         self._age_events(t["number"])
-        self.as_("alice").add_labels(t["number"], ["signalbox"])
-        self.assertIn("undid approve by @acme-bot", self.guard(t["number"], label="signalbox"))
+        self.as_("bob").add_labels(t["number"], ["signalbox"])
+        self.assertIn("undid create approved work by @acme-bot", self.guard(t["number"], label="signalbox"))
         self.assertEqual(self.labels(t["number"]), ["signalbox"])
+
+    def test_a_lane_owner_creates_approved_work_in_their_lane(self):
+        hub = self.as_("dave")
+        hub.create_issue("Dave's own", "", ["signalbox", "lane:Docs", "sb:todo"])
+        with mock.patch.object(S.Hub, "approvers_for_lane", lambda h, lane: {"alice", "dave"} if lane and lane["name"] == "Docs" else {"alice"}):
+            self.assertIsNone(self.guard(1))
+        self.as_("dave").create_issue("Old order", "", ["signalbox", "sb:todo", "lane:Docs"])  # issues made before lanes came first
+        with mock.patch.object(S.Hub, "approvers_for_lane", lambda h, lane: {"alice", "dave"} if lane and lane["name"] == "Docs" else {"alice"}):
+            self.assertIsNone(self.guard(2))
+
+    def test_a_yolo_finish_is_judged_by_the_chain_as_it_was(self):
+        self.sb("propose", "Docs", "Base", agent="claude-code")
+        self.sb("propose", "Docs", "Target", "--deps", "SB-1", agent="claude-code")
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("yolo", "SB-2", "on", tty=True)
+        bot = dict(user="acme-bot", agent="claude-code")
+        self.sb("claim", "SB-1", "--no-worktree", **bot)
+        self.sb("finish", "SB-1", "-m", "Done", **bot)
+        self.sb("claim", "SB-2", "--no-worktree", **bot)
+        self.sb("finish", "SB-2", "-m", "Done", **bot)  # the chain's end goes to review: YOLO covers nothing now
+        self.as_("carol").add_labels(1, ["kind:task"])  # any later event on SB-1
+        out = self.guard(1)
+        self.assertNotIn("mark done", out or "")
+        self.assertEqual(self.state("SB-1"), "done")
+
+    def test_agents_cannot_stretch_a_yolo_chain(self):
+        n = self.approved("Mine")
+        self.sb("propose", "Docs", "Head", agent="claude-code")
+        self.sb("approve", "SB-2", tty=True)
+        self.sb("yolo", "SB-2", "on", tty=True)
+        self.assertIn("YOLO chain", self.sb("depend", "SB-2", f"SB-{n}", agent="claude-code", code=1))
+        # Directly on GitHub: a YOLO stop placed by the agent account, or a link added to the head.
+        self.as_("acme-bot").add_labels(n, ["sb:yolo-stop"])
+        self.assertIn("undid make YOLO stop before it by @acme-bot", self.guard(n))
+        before = self.as_("alice").get_issue(2)
+        desc, meta = S.split_body(before["body"])
+        self.as_("acme-bot").update_issue(2, body=S.join_body(desc, dict(meta, deps=[n])))
+        out = self.guard(2, "edited", sender="acme-bot", changes={"body": {"from": before["body"]}})
+        self.assertIn("link work into a YOLO chain", out)
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(2)["body"])[1].get("deps", []), [])
+
+    def test_repeated_rewrites_go_back_to_the_last_permitted_version(self):
+        n = self.approved()
+        bot = self.as_("acme-bot")
+        original = bot.get_issue(n)["body"]
+        bot.update_issue(n, body="first rewrite")
+        bot.update_issue(n, body="second rewrite")
+        # Only the second edit's run happens (or both, in any order): the original comes back either way.
+        out = self.guard(n, "edited", sender="acme-bot", changes={"body": {"from": "first rewrite"}})
+        self.assertIn("rewrite approved work", out)
+        self.assertEqual(S.split_body(bot.get_issue(n)["body"])[0], S.split_body(original)[0])
+        self.assertIsNone(self.guard(n, "edited", sender="acme-bot", changes={"body": {"from": original}}))
+
+    def test_bad_meta_and_unreadable_teams_never_crash_into_silence(self):
+        self.sb("propose", "Docs", "Fine", agent="claude-code")
+        self.as_("acme-bot").create_issue("Broken", "<!-- signalbox:meta {\"deps\":5,\"map\":[1]} -->", ["signalbox", "sb:proposed"])
+        self.assertIsNotNone(self.hub().board())
+        with mock.patch.object(S.Hub, "approvers_for_lane", lambda h, lane: {S.NOBODY}):
+            self.as_("carol").add_labels(1, ["sb:todo"])
+            with self.assertRaises(S.GuardBlind):
+                self.guard(1)
+        self.assertIn("sb:todo", self.labels(1))  # nothing changed while blind
+        self.assertIn("undid approve by @carol", self.guard(1))  # and the next run that can see puts it right
+
+    def test_the_sweep_puts_right_what_no_run_judged(self):
+        n = self.approved()
+        self.as_("acme-bot").add_labels(n, ["sb:yolo"])  # its run failed or was cancelled
+        out = S.guard_sweep(self.hub(user="github-actions[bot]"))
+        self.assertTrue(any("turn YOLO on" in o for o in out))
+        self.assertNotIn("sb:yolo", self.labels(n))
 
     def test_guard_restores_approved_tasks_that_agent_accounts_rewrite(self):
         self.sb("propose", "Docs", "Write the guide", "Cover install and upgrade", agent="claude-code")
@@ -649,7 +722,8 @@ class Guard(World):
         before = self.as_("alice").get_issue(1)
         self.as_("acme-bot").update_issue(1, title="Do nothing", body=S.join_body("Skip it", {"by": "claude-code"}))
         out = self.guard(1, "edited", sender="acme-bot", changes={"title": {"from": before["title"]}, "body": {"from": before["body"]}})
-        self.assertIn("undid change an approved task", out)
+        self.assertIn("undid change the title of approved work by @acme-bot", out)
+        self.assertIn("undid rewrite approved work by @acme-bot", out)
         after = self.as_("alice").get_issue(1)
         self.assertEqual(after["title"], "Write the guide")
         desc, meta = S.split_body(after["body"])

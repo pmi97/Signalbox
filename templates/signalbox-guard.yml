@@ -10,34 +10,46 @@ name: signalbox-guard
 on:
   issues:
     types: [labeled, unlabeled, closed, reopened, edited]
+  schedule:
+    - cron: "23 * * * *"  # every hour: judge again what a failed or cancelled run left
 
 permissions:
   issues: write
   contents: read
 
 # One run per issue at a time. GitHub may drop a waiting run when a newer one queues; that loses nothing, since
-# each run replays the issue's recent history with the account behind every change. Edits are judged from their
-# own event alone, so they get runs of their own that nothing cancels.
+# every run replays the issue's whole history and judges each change by the rules in force when it was made.
 concurrency:
-  group: signalbox-guard-${{ github.event.issue.number }}-${{ github.event.action == 'edited' && github.run_id || 'labels' }}
+  group: signalbox-guard-${{ github.event.issue.number || 'sweep' }}
   cancel-in-progress: false
 
 jobs:
   guard:
     # Also when the signalbox label itself goes, so taking a task off the board is seen too.
-    if: contains(github.event.issue.labels.*.name, 'signalbox') || github.event.label.name == 'signalbox'
+    if: github.event_name == 'schedule' || contains(github.event.issue.labels.*.name, 'signalbox') || github.event.label.name == 'signalbox'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
+      # The whole history of the config, so each change is judged by the approvers of its day. Only this
+      # repository's default branch runs here, so the read-only token may stay for git to fetch what it needs.
       - uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
           sparse-checkout: |
             .signalbox
             .agents/skills/signalbox
       - name: Undo decisions made by accounts that may not make them
+        if: github.event_name != 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SIGNALBOX_USER: github-actions
           SIGNALBOX_AGENT: signalbox-guard
         run: python3 .agents/skills/signalbox/signalbox.py guard --event "$GITHUB_EVENT_PATH"
+      - name: Sweep the board
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNALBOX_USER: github-actions
+          SIGNALBOX_AGENT: signalbox-guard
+        run: python3 .agents/skills/signalbox/signalbox.py guard --sweep

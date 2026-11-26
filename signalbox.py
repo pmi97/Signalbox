@@ -17,6 +17,7 @@ Python 3.8+, standard library only. `python signalbox.py -h` lists the commands.
 """
 
 import argparse
+import copy
 import fnmatch
 import getpass
 import hmac
@@ -168,6 +169,26 @@ def dumps_meta(meta):
     return json.dumps(meta, sort_keys=True, separators=(",", ":"), ensure_ascii=False).replace(">", "\\u003e")
 
 
+def clean_meta(meta):
+    """The meta block with every known field of the type readers expect; anyone can write an issue body."""
+    if not isinstance(meta, dict):
+        return {}
+    out = dict(meta)
+    ints = lambda v: [x for x in v if isinstance(x, int) and not isinstance(x, bool)] if isinstance(v, list) else []
+    strs = lambda v: [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+    if "deps" in out:
+        out["deps"] = ints(out["deps"])
+    if "paths" in out:
+        out["paths"] = strs(out["paths"])
+    if "map" in out and not (isinstance(out["map"], int) and not isinstance(out["map"], bool)):
+        out.pop("map")
+    for key in ("by", "at"):
+        if key in out and not isinstance(out[key], str):
+            out.pop(key)
+    out.pop("kind", None)  # a kind lives in its label, which the guard watches
+    return out
+
+
 def split_body(body):
     """(description, meta) of an issue body."""
     body = (body or "").replace("\r\n", "\n")
@@ -180,7 +201,7 @@ def split_body(body):
     except ValueError:
         meta = {}
     desc = re.sub(r"\n{3,}", "\n\n", (body[:m.start()].rstrip() + "\n\n" + body[m.end():].lstrip()).strip())
-    return desc, meta if isinstance(meta, dict) else {}
+    return desc, clean_meta(meta)
 
 
 def join_body(desc, meta):
@@ -439,12 +460,18 @@ class FileTracker:
         return out
 
     def _event(self, data, number, event, **extra):
-        """Keep the issue's timeline as GitHub does: who labelled, unlabelled, closed, reopened or renamed it."""
+        """Keep the issue's timeline as GitHub does: who labelled, unlabelled, closed, reopened or renamed it, with
+        an id from one sequence across the repository."""
+        data["event_seq"] = data.get("event_seq", 0) + 1
         data.setdefault("events", {}).setdefault(str(number), []).append(
-            {"event": event, "actor": self.whoami(), "created_at": iso(now()), **extra})
+            {"id": data["event_seq"], "event": event, "actor": self.whoami(), "created_at": iso(now()), **extra})
 
     def list_events(self, number):
         return [dict(e) for e in self._read().get("events", {}).get(str(number), [])]
+
+    def body_revisions(self, number):
+        """Every version of the issue's body, oldest first, with who wrote it (GitHub's edit history)."""
+        return [dict(r) for r in self._read().get("revisions", {}).get(str(number), [])]
 
     def _issue(self, data, number):
         issue = data["issues"].get(str(number))
@@ -473,8 +500,9 @@ class FileTracker:
                      "state": "open", "state_reason": None, "assignees": list(assignees), "user": self.whoami(),
                      "created_at": stamp, "updated_at": stamp, "url": f"{self.describe()}#{n}"}
             data["issues"][str(n)] = issue
+            data.setdefault("revisions", {})[str(n)] = [{"at": stamp, "editor": self.whoami(), "body": body}]
             for lab in issue["labels"]:
-                self._event(data, n, "labeled", label=lab)
+                self._event(data, n, "labeled", label=lab, birth=True)
             return dict(issue)
         return self._tx(fn)
 
@@ -492,6 +520,9 @@ class FileTracker:
                             **({"state_reason": issue.get("state_reason") or "completed"} if issue["state"] == "closed" else {}))
             if before["title"] != issue["title"]:
                 self._event(data, number, "renamed", rename={"from": before["title"], "to": issue["title"]})
+            if before["body"] != issue["body"]:
+                data.setdefault("revisions", {}).setdefault(str(number), []).append(
+                    {"at": iso(now()), "editor": self.whoami(), "body": issue["body"]})
             self._touch(issue)
             return dict(issue)
         return self._tx(fn)
@@ -501,7 +532,7 @@ class FileTracker:
             issue = self._issue(data, number)
             for lab in labels:
                 if lab not in issue["labels"]:
-                    self._event(data, number, "labeled", label=lab)
+                    self._event(data, number, "labeled", label=lab, birth=False)
             issue["labels"] = list(dict.fromkeys(issue["labels"] + list(labels)))
             self._touch(issue)
         self._tx(fn)
@@ -832,7 +863,7 @@ class GitHubTracker:
         """The issue's timeline of label, close, reopen and rename events, oldest first, with who made each."""
         out = []
         for e in self.pages(f"/repos/{self.repo}/issues/{number}/events"):
-            item = {"event": e.get("event"), "actor": login_of((e.get("actor") or {}).get("login")),
+            item = {"id": e.get("id"), "event": e.get("event"), "actor": login_of((e.get("actor") or {}).get("login")),
                     "created_at": e.get("created_at")}
             if e.get("label"):
                 item["label"] = e["label"].get("name")
@@ -841,6 +872,24 @@ class GitHubTracker:
             if e.get("rename"):
                 item["rename"] = e["rename"]
             out.append(item)
+        return out
+
+    def body_revisions(self, number):
+        """The issue body's edit history from GitHub (GraphQL), oldest first, or None when it cannot be read or does
+        not hold whole versions (its newest entry must be the body as it is now)."""
+        q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){issue(number:$n){body author{login} "
+             "createdAt userContentEdits(last:100){nodes{editedAt editor{login} diff}}}}}")
+        owner, name = self.repo.split("/", 1)
+        try:
+            payload, _ = self.call("POST", "/graphql", {"query": q, "variables": {"o": owner, "r": name, "n": number}})
+            issue = payload["data"]["repository"]["issue"]
+            nodes = list(reversed(issue["userContentEdits"]["nodes"]))  # GitHub lists the newest first
+        except (SignalboxError, KeyError, TypeError):
+            return None
+        out = [{"at": n.get("editedAt"), "editor": login_of((n.get("editor") or {}).get("login")), "body": n.get("diff") or ""}
+               for n in nodes if isinstance(n, dict)]
+        if not out or out[-1]["body"].strip() != (issue.get("body") or "").strip():
+            return None
         return out
 
     def search_issues(self, q):
@@ -909,9 +958,10 @@ class Interlock:
     @staticmethod
     def _record(message):
         try:
-            return json.loads(message.split("\n\n", 1)[1])
+            rec = json.loads(message.split("\n\n", 1)[1])
         except (IndexError, ValueError):
             return {}
+        return rec if isinstance(rec, dict) else {}  # anyone with push access writes lock refs
 
     def _local_table(self, prefix):
         out = git("for-each-ref", "--format=%(refname)%00%(objectname)%00%(contents)%01", prefix + "/", cwd=self.cwd)
@@ -1432,6 +1482,33 @@ class Hub:
     def tid(self, n):
         return f"{self.prefix}-{n}"
 
+    def at(self, when):
+        """This hub with the rules (approvers, lanes, teams, agent accounts) the config held at `when`, read from the
+        config's history on this branch: a decision is judged by the rules in force when it was made."""
+        hist = getattr(self, "_config_history", None)
+        if hist is None:
+            rel = os.path.relpath(self.project.config_path, self.project.main).replace(os.sep, "/") \
+                if self.project.config_path else f"{STATE_DIR}/{CONFIG_FILE}"
+            out = git("log", "--first-parent", "--format=%H %ct", "--", rel, cwd=self.project.root, check=False).stdout
+            hist = self._config_history = ([(int(t), h) for h, t in (line.split() for line in out.splitlines() if line.strip())], rel)
+            self._at = {}
+        commits, rel = hist
+        if not commits or when is None:
+            return self
+        stamp = when.timestamp()
+        sha = next((h for t, h in commits if t <= stamp), commits[-1][1])  # before the first config: the first one
+        if sha == commits[0][1] and self.project.config_path and not self.project.linked:
+            return self  # the newest committed config is the one this hub runs with
+        if sha not in self._at:
+            text = git("show", f"{sha}:{rel}", cwd=self.project.root, check=False)
+            if text.returncode != 0:
+                return self
+            other = copy.copy(self)
+            other.config = load_config(f"{sha}:{rel}", text=text.stdout)
+            other.team = frozenset(login_of(x) for x in other.config["agents"].get("logins") or [])
+            self._at[sha] = other
+        return self._at[sha]
+
     def invalidate(self):
         """Forget the issue listing after a write. Labels stay: only lane changes touch them, and those reset them."""
         self._issues = None
@@ -1508,7 +1585,7 @@ class Hub:
         for lab in issue["labels"]:
             if lab.startswith(KIND_PREFIX) and lab[len(KIND_PREFIX):] in KINDS:
                 return lab[len(KIND_PREFIX):]
-        return split_body(issue["body"])[1].get("kind") or "build"
+        return "build"
 
     @staticmethod
     def state_of(issue):
@@ -1574,10 +1651,11 @@ class Hub:
             self.warnings.append(str(e))
             return {}
 
-    def board(self):
-        """The whole hub as a Kanvas board, with each task's issue, kind and lock under `sb`."""
+    def board(self, notes=True, locks=True):
+        """The whole hub as a Kanvas board, with each task's issue, kind and lock under `sb`. Without notes and locks
+        it costs one listing of the issues (the guard's view)."""
         issues = self.issues()
-        locks = self.lock_table()
+        locks = self.lock_table() if locks else {}
         lanes = self.lanes()
         live = {n: i for n, i in issues.items() if self.state_of(i) is not None}
         maps = {n: i for n, i in live.items() if self.kind_of(i) == "map"}
@@ -1591,7 +1669,7 @@ class Hub:
             parent = meta.get("map")
             group = f"M{n}" if kind == "map" else f"M{parent}" if parent in maps else lane["id"] if lane else None
             deps = [self.tid(d) for d in meta.get("deps", []) if isinstance(d, int) and d in live]
-            notes = [parse_note(c, self.team) for c in self.comments(issue)]
+            notes = [parse_note(c, self.team) for c in self.comments(issue)] if notes is not False else []
             sb = {"issue": n, "url": issue.get("url"), "kind": kind}
             if is_external(issue, self.team):
                 sb["external"] = True  # written by someone outside the team
@@ -1809,7 +1887,8 @@ class Hub:
         state = state or "todo"
         meta = {"by": self.actor.by, "at": iso(now()), "deps": sorted(set(dep_numbers)), "map": parent,
                 "paths": list(paths or [])}
-        labels = [MARK, STATE_LABELS[state]] + ([lane["label"]] if lane else []) + ([KIND_PREFIX + kind] if kind != "build" else [])
+        # The lane and kind come before the state, so whoever reads the issue's history sees where it was created.
+        labels = [MARK] + ([lane["label"]] if lane else []) + ([KIND_PREFIX + kind] if kind != "build" else []) + [STATE_LABELS[state]]
         issue = self.remember(self.tracker.create_issue(title, join_body(desc, meta), labels))
         n = issue["number"]
         self._link_deps(n, dep_numbers)
@@ -1869,6 +1948,11 @@ class Hub:
             return targets
         if self.state_of(issue) == "done":
             raise SignalboxError(f"{self.tid(n)} is done; it cannot wait on anything now")
+        board = self.board(notes=False, locks=False)
+        if (self.tid(n).upper() in K.yolo_cover(board) or YOLO_LABEL in issue["labels"] or YOLO_STOP_LABEL in issue["labels"]) \
+                and not self.may_decide(self.lane_of(issue)):
+            raise SignalboxError(f"{self.tid(n)} is part of a YOLO chain: work linked into it would skip review. Ask an "
+                                 "approver to link it.")
         self._check_deps(n, targets)
         self.update_meta(issue, lambda m: m.__setitem__("deps", sorted(set(m.get("deps", [])) | set(targets))))
         self._link_deps(n, targets)
@@ -3740,6 +3824,11 @@ def cmd_doctor(args):
               f"The holder runs `{command('heartbeat ID')}`, or someone takes over with `{command('claim ID --take-over')}`.")
     except SignalboxError as e:
         check(False, str(e))
+    names = list(hub.config.get("approvers") or []) + [o for lane in hub.config["lanes"] for o in lane.get("owners") or []]
+    teams = sorted({str(x).lstrip("@") for x in names if "/" in str(x)} - set(hub.config.get("teams") or {}))
+    check(not teams, "approvers the guard can read" if not teams else f"teams among the approvers: {', '.join(teams)}",
+          f"The guard's workflow token cannot list team members: add them under \"teams\" in {STATE_DIR}/{CONFIG_FILE} "
+          "(\"org/team\": [logins]); until then the guard changes nothing on those lanes.")
     prunable = [w["path"] for w in hub.worktrees.list() if w.get("prunable")]
     check(not prunable, "worktrees intact" if not prunable else f"missing worktrees: {', '.join(prunable)}", f"`{command('gc')}` prunes them.")
     return 0 if ok else 1
@@ -3749,9 +3838,6 @@ def cmd_doctor(args):
 # decisions into rules even for clients that do not run Signalbox: an approval, acceptance or YOLO by someone who may
 # not decide is undone, with a comment saying why.
 
-GUARD_WINDOW = timedelta(minutes=30)
-
-
 def guard_managed(label):
     """Labels whose changes are decisions or carry them. The lock mirror (sb:locked) is not one."""
     label = label or ""
@@ -3759,92 +3845,123 @@ def guard_managed(label):
         label.startswith(LANE_PREFIX) or label.startswith(KIND_PREFIX)
 
 
-def guard_replay(hub, issue, events, at=None):
-    """Replay an issue's timeline (label, close and reopen events, each with the account GitHub recorded) and keep
-    only the changes their authors may make. Returns (legit, violations): legit is {"labels", "open", "reason"} as the
-    issue would be without the refused changes; violations are [(event, decision)] inside the judged window.
+class GuardBlind(SignalboxError):
+    """The guard cannot tell who may decide (a team it cannot read): it changes nothing and fails the run."""
 
-    Events are judged against the state the issue legitimately had when they happened, so no order of changes can
-    make an approval look like a pause, and a run that GitHub cancels only hands its events to the next run. Only
-    recent events are judged (GUARD_WINDOW, or everything since an issue came back onto the board): older ones were
-    judged when they happened, and judging them again against today's approvers or YOLO chains would undo decisions
-    that were right at the time."""
-    at = at or now()
-    sl, agents = STATE_LABELS, hub.team
-    lanes = {x["label"]: x for x in hub.lanes()}
+
+def guard_restricted(rules, actor, issue):
+    """Accounts that may not change approved work at all: agent accounts, and outsiders on the issues they opened."""
+    return actor in rules.team or (actor == login_of(issue.get("user")) and is_external(issue, rules.team))
+
+
+def board_state(labels, is_open=True, reason=None):
+    if not is_open:
+        return "done" if (reason or "completed") == "completed" else None
+    present = [LABEL_STATES[x] for x in labels if x in LABEL_STATES]
+    return max(present, key=K.STATES.index) if present else "proposed"
+
+
+def guard_permitted(hub, actor, lane, issue):
+    """Whether `actor` makes human decisions in `lane` under `hub`'s rules (those in force at the event)."""
+    if not actor or actor in hub.team or (actor == login_of(issue.get("user")) and is_external(issue, hub.team)):
+        return False
+    allowed = hub.approvers_for_lane(lane)
+    if NOBODY in allowed:
+        raise GuardBlind("The guard cannot read the members of a team among the approvers with this token. List them "
+                         f"under \"teams\" in {STATE_DIR}/{CONFIG_FILE} (\"org/team\": [logins]); until then it changes nothing.")
+    return not allowed or actor in allowed
+
+
+def guard_replay(hub, issue, events, until=None, depth=0, before=None):
+    """Replay an issue's whole timeline (label, close and reopen events, each with the account GitHub recorded),
+    judge every change by the rules in force when it was made (`hub.at`) against the state the issue legitimately
+    had then, and keep only the changes their authors may make. Returns (legit, violations): legit is {"labels",
+    "open", "reason"} as the issue would be without the refused changes; violations are [(event, decision, lane)].
+
+    The verdict on an event never changes afterwards, so any run judges the whole history the same way: a run that
+    fails or is cancelled leaves its events to the next one, and no order of changes makes an approval a pause."""
+    sl = STATE_LABELS
+    lanes_now = {x["label"]: x for x in hub.lanes()}
     order = [x["label"] for x in hub.lanes()]
-    author, outside_author = login_of(issue.get("user")), is_external(issue, agents)
     tid = hub.tid(issue["number"]).upper()
-    start = at - GUARD_WINDOW
-    for i, e in enumerate(events):  # a task that came (back) onto the board is judged since it left it, or began
-        t = parse_iso(e.get("created_at"))
-        if e.get("event") == "labeled" and e.get("label") == MARK and t and t >= start:
-            left = [parse_iso(x.get("created_at")) for x in events[:i] if x.get("event") == "unlabeled" and x.get("label") == MARK]
-            start = min(start, left[-1]) if left and left[-1] else datetime(1970, 1, 1, tzinfo=timezone.utc)
-            break
     legit = {"labels": set(), "open": True, "reason": None}
-    violations, cover = [], None
+    violations = []
+    created = parse_iso(issue.get("created_at"))
+    author = login_of(issue.get("user"))
 
-    def state(labels):
-        present = [LABEL_STATES[x] for x in labels if x in LABEL_STATES]
-        return max(present, key=K.STATES.index) if present else "proposed"
+    def lane_in(labels, rules):
+        lanes = {x["label"]: x for x in rules.lanes()}
+        return next((lanes[x] for x in order + sorted(lanes) if x in labels and x in lanes), None)
 
-    def lane_in(labels):
-        return next((lanes[x] for x in order if x in labels), None)
+    # The labels an issue is created with arrive as separate events; judge them as one change, the creation. GitHub
+    # stamps them with the issue's creation time; a later change in that same second by its author counts with it.
+    def born(e):
+        if "birth" in e:
+            return e["birth"]
+        return login_of(e.get("actor")) == author and created is not None and parse_iso(e.get("created_at")) == created
+    birth, rest = [], list(events)
+    while rest and rest[0].get("event") == "labeled" and born(rest[0]):
+        birth.append(rest.pop(0))
+    if birth:
+        rules = hub.at(created)
+        labels = {e.get("label") for e in birth if guard_managed(e.get("label"))}
+        granted = labels & {sl["todo"], sl["doing"], sl["review"], YOLO_LABEL, YOLO_STOP_LABEL}
+        if granted and author not in TRUSTED_BOTS and not guard_permitted(rules, author, lane_in(labels, rules), issue):
+            violations.append((birth[-1], "create approved work", lane_in(labels, rules)))
+            labels -= granted
+        legit["labels"] |= labels
 
-    def permitted(actor, lane):
-        if not actor or actor in agents or (actor == author and outside_author):
-            return False
-        allowed = hub.approvers_for_lane(lane)
-        return not allowed or actor in allowed
-
-    for e in events:
+    for e in rest:
         kind, actor, label = e.get("event"), login_of(e.get("actor")), e.get("label")
         if kind in ("labeled", "unlabeled") and not guard_managed(label) or kind not in ("labeled", "unlabeled", "closed", "reopened"):
             continue
-        labels, is_open = legit["labels"], legit["open"]
-        cur, lane, decision = state(labels), lane_in(labels), None
         t = parse_iso(e.get("created_at"))
-        judged = actor not in TRUSTED_BOTS and (t is None or t >= start)  # the guard's own corrections stand
-        if judged and kind == "labeled":
-            if label == sl["todo"] and sl["doing"] not in labels:  # with doing: a pause or handoff
-                decision = "send back" if sl["review"] in labels else "approve" if cur == "proposed" else None
-            elif label == sl["doing"] and not (sl["todo"] in labels and sl["proposed"] not in labels):
-                decision = "start work no one approved"  # a claim moves todo to doing
-            elif label == sl["review"] and sl["doing"] not in labels:  # with doing: finish
-                decision = "move to review without doing the work"
-            elif label == YOLO_LABEL:
-                decision = "turn YOLO on"
-            elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
-                decision, lane = f"move approved work into lane {label[len(LANE_PREFIX):]}", lanes.get(label)
-            elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
-                decision = "change the kind of approved work"
-        elif judged and kind == "unlabeled":
-            if label in (sl["todo"], sl["doing"], sl["review"]) and is_open and cur != "proposed" and \
-                    state(labels - {label}) == "proposed":  # moves add the new state before taking the old one off
-                decision = "move approved work back to proposed"
-            elif label == YOLO_STOP_LABEL and is_open:
-                decision = "remove a YOLO stop"
-            elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
-                decision, lane = f"move approved work out of lane {label[len(LANE_PREFIX):]}", lanes.get(label)
-            elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
-                decision = "change the kind of approved work"
-            elif label == MARK and is_open and cur != "proposed":
-                decision = "take approved work off the board"
-        elif judged and kind == "closed" and is_open:
-            if (e.get("state_reason") or "completed") == "completed":
-                if sl["doing"] in labels:  # an agent finishing under YOLO closes its task itself
-                    cover = K.yolo_cover(hub.board()) if cover is None else cover
-                    via = cover.get(tid)
-                    decision = None if via and via.upper() != tid else "mark done"
-                else:
-                    decision = "mark done"
-            elif cur != "proposed":  # withdrawing a proposal is anyone's; rejecting approved work is not
-                decision = "reject"
-        elif judged and kind == "reopened" and not is_open and (cur != "proposed" or legit["reason"] == "completed"):
-            decision = "reopen closed work"
-        if decision and not permitted(actor, lane):
-            violations.append((e, decision))
+        if until and t and t > until or before is not None and isinstance(e.get("id"), int) and e["id"] >= before:
+            break
+        labels, is_open = legit["labels"], legit["open"]
+        cur = board_state(labels)
+        rules = hub.at(t)
+        lane, decision = lane_in(labels, rules), None
+        if actor not in TRUSTED_BOTS:  # the guard's own corrections stand
+            if kind == "labeled":
+                if label == sl["todo"] and sl["doing"] not in labels:  # with doing: a pause or handoff
+                    decision = "send back" if sl["review"] in labels else "approve" if cur == "proposed" else None
+                elif label == sl["doing"] and not (sl["todo"] in labels and sl["proposed"] not in labels):
+                    decision = "start work no one approved"  # a claim moves todo to doing
+                elif label == sl["review"] and sl["doing"] not in labels:  # with doing: finish
+                    decision = "move to review without doing the work"
+                elif label == YOLO_LABEL:
+                    decision = "turn YOLO on"
+                elif label == YOLO_STOP_LABEL:
+                    decision = "make YOLO stop before it"  # YOLO then covers what it waits on
+                elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
+                    decision = f"move approved work into lane {label[len(LANE_PREFIX):]}"
+                    lane = {x["label"]: x for x in rules.lanes()}.get(label) or lanes_now.get(label)
+                elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
+                    decision = "change the kind of approved work"
+            elif kind == "unlabeled":
+                if label in (sl["todo"], sl["doing"], sl["review"]) and is_open and cur != "proposed" and \
+                        board_state(labels - {label}) == "proposed":  # moves add the new state before taking the old off
+                    decision = "move approved work back to proposed"
+                elif label == YOLO_STOP_LABEL and is_open:
+                    decision = "remove a YOLO stop"
+                elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
+                    decision = f"move approved work out of lane {label[len(LANE_PREFIX):]}"
+                    lane = {x["label"]: x for x in rules.lanes()}.get(label) or lanes_now.get(label)
+                elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
+                    decision = "change the kind of approved work"
+                elif label == MARK and is_open and cur != "proposed":
+                    decision = "take approved work off the board"
+            elif kind == "closed" and is_open:
+                if (e.get("state_reason") or "completed") == "completed":
+                    covered = sl["doing"] in labels and depth == 0 and yolo_covered_at(hub, issue["number"], t, e.get("id"))
+                    decision = None if covered else "mark done"  # an agent finishing under YOLO closes its task itself
+                elif cur != "proposed":  # withdrawing a proposal is anyone's; rejecting approved work is not
+                    decision = "reject"
+            elif kind == "reopened" and not is_open and (cur != "proposed" or legit["reason"] == "completed"):
+                decision = "reopen closed work"
+        if decision and not guard_permitted(rules, actor, lane, issue):
+            violations.append((e, decision, lane))
             continue
         if kind == "labeled":
             labels.add(label)
@@ -3857,98 +3974,206 @@ def guard_replay(hub, issue, events, at=None):
     return legit, violations
 
 
-def guard_event(hub, event):
-    """Undo human-only decisions made on GitHub by accounts that may not make them. Returns what was undone."""
-    issue_raw = event.get("issue") or {}
-    sender = login_of((event.get("sender") or {}).get("login"))
-    action = event.get("action")
-    if not issue_raw:
-        return None
-    n = issue_raw["number"]
+def yolo_covered_at(hub, n, when, event_id=None):
+    """Whether YOLO covered task `n` when it was closed: a YOLO task (or a stop) that waits on it carried its label
+    legitimately then and had not gone to review. The chain's links are today's; agents cannot add links to a YOLO
+    chain, and the guard takes those they add on GitHub back out."""
+    board = hub.board(notes=False, locks=False)
+    tasks = K.task_map(board)
+    me = hub.tid(n).upper()
+    snapshot = []
+    for t in board["tasks"]:
+        t = dict(t)
+        t.pop("yolo", None)
+        t.pop("yolo_before", None)
+        if me in K._upstream(tasks, tasks[t["id"].upper()]):  # only what waits on `n` can cover it
+            other = hub.issue(t["sb"]["issue"], fresh=False)
+            # Just before the close: by event ids where GitHub gives them (one order across the repository).
+            legit, _ = guard_replay(hub, other, hub.tracker.list_events(other["number"]), depth=1,
+                                    until=None if isinstance(event_id, int) else when, before=event_id)
+            state = board_state(legit["labels"], legit["open"], legit["reason"])
+            if state is None:
+                continue
+            t["state"] = state
+            if YOLO_LABEL in legit["labels"]:
+                t["yolo"] = True
+            if YOLO_STOP_LABEL in legit["labels"]:
+                t["yolo_before"] = True
+        snapshot.append(t)
+    via = K.yolo_cover(dict(board, tasks=snapshot)).get(me)
+    return bool(via and via.upper() != me)
+
+
+def guard_reconcile(hub, n):
+    """Replay issue `n` and put it back to what its legitimate history leaves. Returns what was undone, or None."""
     tracker = hub.tracker
-    agents = hub.team
-    if action == "edited":
-        return guard_edit(hub, event, sender)
-    issue = tracker.get_issue(n)  # now, not the event's snapshot: later changes may have come meanwhile
+    issue = tracker.get_issue(n)  # now, not an event's snapshot: later changes may have come meanwhile
     events = tracker.list_events(n)
     legit, violations = guard_replay(hub, issue, events)
     if not violations:
         return None
     current = {x for x in issue["labels"] if guard_managed(x)}
-    lane_touched = any(d.startswith("move approved work into lane") or d.startswith("move approved work out of lane")
-                       for _, d in violations)
-    want = {x for x in legit["labels"] if guard_managed(x) and (lane_touched or not x.startswith(LANE_PREFIX))}
-    have = {x for x in current if lane_touched or not x.startswith(LANE_PREFIX)}
+    # Lanes follow the legitimate state only where a refused move touched them, and only with labels that still
+    # exist: lanes get renamed and removed without events on their issues.
+    touched = {LANE_PREFIX + d.split(" lane ", 1)[1] for _, d, _ in violations if " lane " in d}
+    existing = {lab["name"] for lab in hub.labels()} | {lane["label"] for lane in hub.lanes()}
+    want = {x for x in legit["labels"] if not x.startswith(LANE_PREFIX) or (x in touched and x in existing)}
+    have = {x for x in current if not x.startswith(LANE_PREFIX) or x in touched}
+    add, remove = sorted(want - have), sorted(have - want)
     is_open = issue["state"] == "open"
-    if want == have and legit["open"] == is_open:
+    if not add and not remove and legit["open"] == is_open:
         return None  # what was refused is undone already, by an earlier run
     if legit["open"] and not is_open:
         tracker.update_issue(n, state="open")
-    for lab in sorted(want - have):
+    for lab in add:
         tracker.add_labels(n, [lab])
-    for lab in sorted(have - want):
+    for lab in remove:
         tracker.remove_label(n, lab)
     if not legit["open"] and is_open:
         tracker.update_issue(n, state="closed", state_reason=legit["reason"] or "completed")
-    # Name what this run undoes: the refused changes since the guard last corrected this issue.
+    # Name the refused changes since the guard last corrected this issue.
     position = {id(e): i for i, e in enumerate(events)}
     fixed_at = max((i for i, e in enumerate(events) if login_of(e.get("actor")) in TRUSTED_BOTS), default=-1)
-    violations = [(e, d) for e, d in violations if position[id(e)] > fixed_at] or violations
+    named = [v for v in violations if position.get(id(v[0]), len(events)) > fixed_at] or violations
     lines = []
-    for e, decision in violations:
+    for e, decision, lane in named:
         actor = login_of(e.get("actor")) or "someone"
-        who = "an agent account" if actor in agents else \
-            "outside the team" if actor == login_of(issue.get("user")) and is_external(issue, agents) else "not an approver here"
+        who = "an agent account" if actor in hub.team else \
+            "outside the team" if actor == login_of(issue.get("user")) and is_external(issue, hub.team) else "not an approver here"
         lines.append(f"- **{decision}** by @{actor}, who is {who}")
-    allowed_txt = people(hub.approvers_for(issue)) or "a person"
     tracker.add_comment(n, render_note("Undid what only an approver may do:\n" + "\n".join(dict.fromkeys(lines)) +
-                                       f"\n\nThose decisions belong to {allowed_txt}.", Actor("signalbox-guard", False), "event"))
-    return "; ".join(dict.fromkeys(f"undid {d} by @{login_of(e.get('actor'))} on #{n}" for e, d in violations))
+                                       f"\n\nThose decisions belong to {people(hub.approvers_for(issue)) or 'a person'}.",
+                                       Actor("signalbox-guard", False), "event"))
+    return "; ".join(dict.fromkeys(f"undid {d} by @{login_of(e.get('actor'))} on #{n}" for e, d, _ in violations))
 
 
-def guard_edit(hub, event, sender):
-    """An agent account rewriting an approved task's title, description or dependencies: put them back."""
-    issue = GitHubTracker._issue(event.get("issue") or {})
+def guard_edit(hub, event):
+    """Title and description changes of approved work by accounts that may not make them: put back the last
+    version a permitted author wrote. Agent accounts may not change an approved task's description, map or
+    dependencies, nor anyone but its approvers link more work into a YOLO chain."""
+    raw = event.get("issue") or {}
+    n = raw.get("number")
+    if not n:
+        return None
+    tracker = hub.tracker
+    issue = tracker.get_issue(n)
     if MARK not in issue["labels"]:
         return None
-    n, tracker, agents = issue["number"], hub.tracker, hub.team
-    action = event.get("action")
-    present = [LABEL_STATES[x] for x in issue["labels"] if x in LABEL_STATES]
-    prev = max(present, key=K.STATES.index) if present else "proposed"
-    decision, undo = None, None
-    if action == "edited" and sender in agents and prev != "proposed":
-        fixes, changes = {}, event.get("changes") or {}
-        if "title" in changes and (changes["title"] or {}).get("from") is not None:
-            fixes["title"] = changes["title"]["from"]
-        if "body" in changes and (changes["body"] or {}).get("from") is not None:
-            old_desc, old_meta = split_body(changes["body"]["from"])
-            new_desc, new_meta = split_body(issue["body"])
-            changed = False
-            if hub.kind_of(issue) == "map":  # agents chart fog and scope; the destination and notes are the people's
-                for name in ("Destination", "Notes"):
-                    if section(old_desc, name) != section(new_desc, name):
-                        new_desc, changed = set_section(new_desc, name, section(old_desc, name)), True
-            elif old_desc != new_desc:
-                new_desc, changed = old_desc, True
-            lost = set(old_meta.get("deps") or []) - set(new_meta.get("deps") or [])
-            if lost:
-                new_meta["deps"] = sorted(set(new_meta.get("deps") or []) | lost)
-            if changed or lost:
-                fixes["body"] = join_body(new_desc, new_meta)
-        if fixes:
-            decision, undo = "change an approved task", lambda: tracker.update_issue(n, **fixes)
-    if not decision:
+    events = tracker.list_events(n)
+    edited_at = parse_iso(raw.get("updated_at")) or now()
+    sender = login_of((event.get("sender") or {}).get("login"))
+    legit_then, _ = guard_replay(hub, issue, events, until=edited_at)
+    if board_state(legit_then["labels"], legit_then["open"], legit_then["reason"]) in ("proposed", None):
+        return None  # proposals are their authors' to revise
+    rules = hub.at(edited_at)
+    agent = guard_restricted(rules, sender, issue)
+    fixes, undone = {}, []
+    # Titles: GitHub keeps every rename with its author; replay them.
+    renames = [e for e in events if e.get("event") == "renamed" and isinstance(e.get("rename"), dict)]
+    if renames:
+        title = renames[0]["rename"].get("from")
+        for e in renames:
+            actor = login_of(e.get("actor"))
+            t = parse_iso(e.get("created_at"))
+            approved = board_state(guard_replay(hub, issue, events, until=t)[0]["labels"]) != "proposed"
+            if actor in TRUSTED_BOTS or not approved or not guard_restricted(hub.at(t), actor, issue):
+                title = e["rename"].get("to")
+            else:
+                undone.append(f"change the title of approved work by @{actor}")
+        if title is not None and title != issue["title"]:
+            fixes["title"] = title
+    # Descriptions: the last version a permitted author wrote, from GitHub's edit history when it can be read.
+    desc, meta = split_body(issue["body"])
+    good_desc, good_meta = None, None
+    revisions = tracker.body_revisions(n)
+    if revisions:
+        for r in revisions:
+            t = parse_iso(r.get("at"))
+            r_desc, r_meta = split_body(r.get("body"))
+            approved = good_desc is not None and \
+                board_state(guard_replay(hub, issue, events, until=t)[0]["labels"]) != "proposed"
+            if good_desc is None or not approved or not guard_restricted(hub.at(t), login_of(r.get("editor")), issue):
+                good_desc, good_meta = r_desc, r_meta
+    elif agent and (event.get("changes") or {}).get("body", {}).get("from") is not None:
+        good_desc, good_meta = split_body(event["changes"]["body"]["from"])
+    if good_desc is not None and agent:
+        new_meta = dict(meta)
+        if hub.kind_of(issue) == "map":  # agents chart fog and scope; the destination and notes are the people's
+            for name in ("Destination", "Notes"):
+                if section(good_desc, name) != section(desc, name):
+                    desc = set_section(desc, name, section(good_desc, name))
+                    undone.append(f"rewrite a map's {name.lower()} by @{sender}")
+            good_desc = desc
+        elif good_desc != desc:
+            undone.append(f"rewrite approved work by @{sender}")
+        if good_meta.get("map") != meta.get("map"):
+            new_meta["map"] = good_meta.get("map")
+            undone.append(f"move approved work to another map by @{sender}")
+        live = {i["number"] for i in tracker.list_issues(MARK) if hub.state_of(i) is not None}
+        lost = {d for d in good_meta.get("deps") or [] if d in live} - set(meta.get("deps") or [])
+        if lost:
+            new_meta["deps"] = sorted(set(new_meta.get("deps") or []) | lost)
+            undone.append(f"remove dependencies of approved work by @{sender}")
+        good_body = join_body(good_desc, new_meta)
+        if good_body != issue["body"] and (good_desc != split_body(issue["body"])[0] or new_meta != meta):
+            fixes["body"] = good_body
+    # Links into a YOLO chain: what they bring in would skip review.
+    added = set(meta.get("deps") or []) - set((good_meta or {}).get("deps") or []) if good_meta is not None else set()
+    if not added and (event.get("changes") or {}).get("body", {}).get("from") is not None:
+        added = set(meta.get("deps") or []) - set(split_body(event["changes"]["body"]["from"])[1].get("deps") or [])
+    if added and not guard_permitted(rules, sender, hub.lane_of(issue), issue):
+        board = hub.board(notes=False, locks=False)
+        cover = K.yolo_cover(board)
+        me = hub.tid(n).upper()
+        if me in cover or YOLO_LABEL in issue["labels"] or YOLO_STOP_LABEL in issue["labels"]:
+            body = fixes.get("body", issue["body"])
+            d, m = split_body(body)
+            m["deps"] = [x for x in m.get("deps") or [] if x not in added]
+            fixes["body"] = join_body(d, m)
+            undone.append(f"link work into a YOLO chain by @{sender}")
+    if not fixes:
         return None
-    undo()
-    tracker.add_comment(n, render_note(f"Undid **{decision}** by @{sender}, who is an agent account. Only people change "
-                                       "approved tasks.", Actor("signalbox-guard", False), "event"))
-    return f"undid {decision} by @{sender} on #{n}"
+    tracker.update_issue(n, **fixes)
+    for d in sorted(added):  # what the link brought in is judged again, now without it
+        try:
+            guard_reconcile(hub, d)
+        except SignalboxError:
+            pass
+    tracker.add_comment(n, render_note("Undid changes only people (and for YOLO chains, approvers) may make:\n" +
+                                       "\n".join(f"- {u}" for u in dict.fromkeys(undone)), Actor("signalbox-guard", False), "event"))
+    return "; ".join(f"undid {u} on #{n}" for u in dict.fromkeys(undone))
+
+
+def guard_event(hub, event):
+    """Undo human-only decisions made on GitHub by accounts that may not make them. Returns what was undone."""
+    issue = event.get("issue") or {}
+    if not issue.get("number"):
+        return None
+    if event.get("action") == "edited":
+        return guard_edit(hub, event)
+    return guard_reconcile(hub, issue["number"])
+
+
+def guard_sweep(hub, days=7):
+    """Judge every board issue changed in the last `days`: what a failed or cancelled run left, the sweep puts right."""
+    since = iso(now() - timedelta(days=days))
+    out = []
+    for issue in hub.tracker.list_issues(MARK):
+        if (issue.get("updated_at") or "") >= since:
+            done = guard_reconcile(hub, issue["number"])
+            if done:
+                out.append(done)
+    return out
 
 
 def cmd_guard(args):
     project = Project()
     tracker = make_tracker(project, project.require_config())
     hub = Hub(project, tracker, Actor("signalbox-guard", False))
+    if args.sweep:
+        out = guard_sweep(hub)
+        print("\n".join(out) or "Nothing to undo.")
+        return 0
     event = json.loads(K.read_text_file(args.event or os.environ.get("GITHUB_EVENT_PATH", "")))
     out = guard_event(hub, event)
     print(out or "Nothing to guard in this event.")
@@ -4763,6 +4988,7 @@ def build_parser():
     p.add_argument("output", nargs="?", default="signalbox-snapshot.html")
     p = add("guard", cmd_guard, "GitHub Actions: undo human-only decisions made by agents or non-approvers")
     p.add_argument("--event", metavar="PATH", help="event JSON (default: $GITHUB_EVENT_PATH)")
+    p.add_argument("--sweep", action="store_true", help="judge every board issue changed in the last week")
     p = add("init", cmd_init, "set Signalbox up in this repository (never overwrites files)")
     p.add_argument("dir", nargs="?")
     p.add_argument("--hub", help="github, github:owner/name, or file (default: github when origin is on GitHub)")
