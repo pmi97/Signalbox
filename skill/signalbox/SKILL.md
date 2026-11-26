@@ -74,6 +74,7 @@ Some efforts are too big and too unclear for one session. Chart them as a **map*
 - Tickets are questions, not slices of a build: `propose - "Which queue fits?" --map SB-4 --kind research` (also `prototype`, `grilling`, `task`). A batch takes `"map": "SB-4"`.
 - **HITL kinds (`grilling`, `prototype`) are resolved live with a person.** Claim them only `--with LOGIN` while that person is in the conversation, and never answer your own questions for them. `research` is AFK: do it alone. `task` is manual work that unblocks a decision, never part of the build.
 - `frontier SB-4` lists what is takeable now. Resolve one ticket per session (research excepted): `claim`, then `resolve ID -m "the answer"`. Once a person accepts it, the answer joins the map's **Decisions so far** by itself.
+- Once a person approves a map, its destination, notes and decisions are theirs: you change only its fog and its scope, with these commands (never by editing the issue), and the guard undoes anything else.
 - What you can sense but not yet phrase sharply goes in the fog: `fog SB-4 --add "..."`. When a resolution makes it specifiable, `graduate SB-4 "match" "The sharp question" --kind grilling`. Work beyond the destination: `scope-out ID -m "why"`.
 - **Plan, don't do.** A map ends when nothing is left to decide; it hands off to a spec and build tasks, it does not build.
 

@@ -17,6 +17,7 @@ Python 3.8+, standard library only. `python signalbox.py -h` lists the commands.
 """
 
 import argparse
+import bisect
 import copy
 import fnmatch
 import functools
@@ -77,6 +78,8 @@ DECISION_KINDS = ("research", "prototype", "grilling", "task")
 HITL_KINDS = ("grilling", "prototype")
 
 MAP_SECTIONS = ("Destination", "Notes", "Decisions so far", "Not yet specified", "Out of scope")
+MAP_AGENT_SECTIONS = ("Not yet specified", "Out of scope")  # on an approved map, agents chart its fog and scope
+BODY_LIMIT = 65536  # the most characters GitHub keeps in an issue body
 # The meta block is usually last, but people and bots append to issue bodies, so it is found anywhere.
 NOTE_RE = re.compile(r"\A<!-- signalbox:note (\{.*?\}) -->\n?", re.S)
 REF_RE = re.compile(r"^\s*(?:[A-Za-z][A-Za-z0-9]*-|#)?(\d+)\s*$")
@@ -914,7 +917,7 @@ class GitHubTracker:
         """The issue body's edit history from GitHub (GraphQL), oldest first, or None when it cannot be read or does
         not hold whole versions (its newest entry must be the body as it is now)."""
         q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){issue(number:$n){body author{login} "
-             "createdAt userContentEdits(last:100){totalCount nodes{editedAt editor{login} diff}}}}}")
+             "createdAt userContentEdits(last:100){totalCount nodes{editedAt editor{login __typename} diff}}}}}")
         owner, name = self.repo.split("/", 1)
         try:
             payload, _ = self.call("POST", "/graphql", {"query": q, "variables": {"o": owner, "r": name, "n": number}})
@@ -924,8 +927,12 @@ class GitHubTracker:
                 return None  # cut off: its oldest entry is not where the text began
         except (SignalboxError, KeyError, TypeError):
             return None
-        out = [{"at": n.get("editedAt"), "editor": login_of((n.get("editor") or {}).get("login")), "body": n.get("diff") or ""}
-               for n in nodes if isinstance(n, dict)]
+        def editor(node):
+            who = node.get("editor") if isinstance(node.get("editor"), dict) else {}
+            login = login_of(who.get("login"))
+            # GraphQL names an app's bot without the "[bot]" the REST API (and so TRUSTED_BOTS) gives it
+            return f"{login}[bot]" if login and who.get("__typename") == "Bot" and not login.endswith("[bot]") else login
+        out = [{"at": n.get("editedAt"), "editor": editor(n), "body": n.get("diff") or ""} for n in nodes if isinstance(n, dict)]
         if not out or out[-1]["body"].strip() != (issue.get("body") or "").strip():
             return None
         return out
@@ -1504,6 +1511,16 @@ def bullets(content):
 NOBODY = "(nobody: the approvers' teams could not be read)"
 
 
+def kind_in(labels):
+    """The kind a set of labels gives a task: its one kind label; where it has several, the first in KINDS that is not
+    a map (agents chart part of a map's text, so two kind labels never make one). The board, the CLI and the guard
+    all read kinds through this, so they never disagree about what a task is."""
+    kinds = [k for k in KINDS if KIND_PREFIX + k in labels]
+    if len(kinds) > 1:
+        kinds = [k for k in kinds if k != "map"]
+    return kinds[0] if kinds else "build"
+
+
 def people(logins):
     return ", ".join(x if x == NOBODY else "@" + x for x in sorted(logins))
 
@@ -1645,10 +1662,7 @@ class Hub:
 
     @staticmethod
     def kind_of(issue):
-        for lab in issue["labels"]:
-            if lab.startswith(KIND_PREFIX) and lab[len(KIND_PREFIX):] in KINDS:
-                return lab[len(KIND_PREFIX):]
-        return "build"
+        return kind_in(issue["labels"])
 
     @staticmethod
     def state_of(issue):
@@ -1660,7 +1674,21 @@ class Hub:
         return max(present, key=K.STATES.index) if present else "proposed"
 
     def lanes(self):
-        """[{id, name, label, owners, wip}]: lanes from the config first, then lane labels found on the hub."""
+        """[{id, name, label, owners, wip}]: lanes from the config first, then lane labels found on the hub. Worked
+        out once for each config and label listing: the guard asks for them at every event it judges."""
+        try:
+            labels = self.labels()
+        except SignalboxError:
+            labels = []
+        key = (self.config, labels, json.dumps(self.config.get("lanes"), sort_keys=True, default=str), self.prefix)
+        memo = self.__dict__.get("_lanes_memo")
+        if memo and memo[0][0] is key[0] and memo[0][1] is key[1] and memo[0][2:] == key[2:]:
+            return list(memo[1])
+        out = self._lanes(labels)
+        self.__dict__["_lanes_memo"] = (key, out)
+        return list(out)
+
+    def _lanes(self, labels):
         out, taken = [], {self.prefix}
         for lane in self.config["lanes"]:
             name = " ".join(str(lane.get("name", "")).split())
@@ -1671,10 +1699,6 @@ class Hub:
             out.append({"id": pid, "name": name, "label": LANE_PREFIX + name, "owners": list(lane.get("owners") or []),
                         "wip": lane.get("wip"), "configured": True})
         known = {lane["label"].lower() for lane in out}
-        try:
-            labels = self.labels()
-        except SignalboxError:
-            labels = []
         for lab in sorted(labels, key=lambda x: x["name"].lower()):
             if not lab["name"].startswith(LANE_PREFIX) or lab["name"].lower() in known:
                 continue
@@ -2451,20 +2475,14 @@ class Hub:
         parent = meta.get("map")
         if not parent or self.kind_of(issue) not in DECISION_KINDS:
             return
-        answer = ""
-        for c in reversed(self.tracker.list_comments(issue["number"])):
-            note = parse_note(c, self.team)
-            if note.get("kind") == "resolution" and not note.get("external") and note["text"].startswith("Resolution:"):
-                answer = note["text"][len("Resolution:"):].strip()
-                break
-        gist = K._gist(answer) if answer else "resolved"
+        gist = resolution_gist(self, issue)
         try:
             m = self.issue(parent)
         except SignalboxError:
             return
         desc, _ = split_body(m["body"])
         current = section(desc, "Decisions so far")
-        line = f"- [{issue['title']}]({issue.get('url') or '#' + str(issue['number'])}): {gist}"
+        line = decision_line(issue, gist)  # the guard lets an agent add this line, and only this, under YOLO
         if line not in current:
             self.update_meta(m, lambda _m: None, desc=set_section(desc, "Decisions so far", (current + "\n" + line).strip()))
 
@@ -4002,7 +4020,21 @@ def yolo_marked(events, position):
     return False
 
 
-def guard_replay(hub, issue, events, until=None, depth=0, before=None):
+def guard_lane_in(hub, rules, labels):
+    """The lane a set of labels puts a task in under `rules`: of its lane labels that `rules` knows, the first in
+    today's lane order, then by name; the CLI's lane_of reads it the same way."""
+    memo = hub.__dict__.setdefault("_guard_memo", {})
+    if ("rank",) not in memo:
+        memo[("rank",)] = {x["label"]: i for i, x in enumerate(hub.lanes())}
+    key = ("lanes", id(rules))
+    if key not in memo:
+        memo[key] = (rules, {x["label"]: x for x in rules.lanes()})
+    rank, known = memo[("rank",)], memo[key][1]
+    present = [x for x in labels if x in known]
+    return known[min(present, key=lambda x: (rank.get(x, len(rank)), x))] if present else None
+
+
+def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=None):
     """Replay an issue's whole timeline (label, close and reopen events, each with the account GitHub recorded),
     judge every change by the rules in force when it was made (`hub.at`) against the state the issue legitimately
     had then, and keep only the changes their authors may make. Returns (legit, violations): legit is {"labels",
@@ -4013,15 +4045,25 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
     fails or is cancelled leaves its events to the next one, and no order of changes makes an approval a pause."""
     sl = STATE_LABELS
     lanes_now = {x["label"]: x for x in hub.lanes()}
-    order = [x["label"] for x in hub.lanes()]
     legit = {"labels": set(), "open": True, "reason": None, "closed_from": None, "marks": [], "grants": {}}
     violations = []
     created = parse_iso(issue.get("created_at"))
     author = login_of(issue.get("user"))
 
     def lane_in(labels, rules):
-        lanes = {x["label"]: x for x in rules.lanes()}
-        return next((lanes[x] for x in order + sorted(lanes) if x in labels and x in lanes), None)
+        return guard_lane_in(hub, rules, labels)
+
+    def lane_named(label, rules):
+        return {x["label"]: x for x in rules.lanes()}.get(label) or lanes_now.get(label)
+
+    def kinds(labels):
+        return {KIND_PREFIX + k for k in KINDS} & set(labels)
+
+    def snap(e=None):
+        if trace is not None:
+            trace.append((parse_iso(e.get("created_at")) if e else None, e.get("id") if e else None,
+                          {"labels": frozenset(legit["labels"]), "open": legit["open"], "reason": legit["reason"],
+                           "closed_from": legit["closed_from"], "grants": dict(legit["grants"])}))
 
     # The labels an issue is created with arrive as separate events; judge them as one change, the creation. GitHub
     # stamps them with the issue's creation time; a later change in that same second by its author counts with it.
@@ -4041,10 +4083,15 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
                 not guard_permitted(rules, author, lane_in(labels, rules), issue, past=rules is not hub):
             violations.append((birth[-1], "create approved work", lane_in(labels, rules)))
             labels -= granted
+        if len(kinds(labels)) > 1 and guard_restricted(rules, author, issue):
+            # one kind to a task: the one every reader takes stays, the others go
+            violations.append((birth[-1], "give work a second kind", lane_in(labels, rules)))
+            labels -= kinds(labels) - {KIND_PREFIX + kind_in(labels)}
         legit["labels"] |= labels
         for label in labels & {YOLO_LABEL, YOLO_STOP_LABEL}:
             legit["grants"][label] = (author, created)
 
+    snap()
     for e in rest:
         kind, actor, label = e.get("event"), login_of(e.get("actor")), e.get("label")
         if kind in ("labeled", "unlabeled") and not guard_managed(label) or kind not in ("labeled", "unlabeled", "closed", "reopened"):
@@ -4056,7 +4103,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
         cur = board_state(labels)
         rules = hub.at(t)
         past = rules is not hub
-        lane, decision = lane_in(labels, rules), None
+        lane, decision, also = lane_in(labels, rules), None, None
         reason = e.get("state_reason") or "completed"
         if actor not in TRUSTED_BOTS:  # the guard's own corrections stand
             if kind == "labeled":
@@ -4073,9 +4120,13 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
                     decision = "make YOLO stop before it"  # YOLO then covers what it waits on
                 elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
                     decision = f"move approved work into lane {label[len(LANE_PREFIX):]}"
-                    lane = {x["label"]: x for x in rules.lanes()}.get(label) or lanes_now.get(label)
+                    if lane and label not in labels and lane["label"] != label:
+                        also = lane  # next to the lane it is in: that lane's approvers decide too
+                    lane = lane_named(label, rules)
                 elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
                     decision = "change the kind of approved work"
+                elif label in kinds([label]) and label not in labels and kinds(labels) and guard_restricted(rules, actor, issue):
+                    decision = "give work a second kind"  # one kind to a task; a proposal's own changes it by swapping
             elif kind == "unlabeled":
                 if label in (sl["todo"], sl["doing"], sl["review"]) and is_open and cur != "proposed" and \
                         board_state(labels - {label}) == "proposed":  # moves add the new state before taking the old off
@@ -4086,7 +4137,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
                     decision = "remove a YOLO stop"
                 elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
                     decision = f"move approved work out of lane {label[len(LANE_PREFIX):]}"
-                    lane = {x["label"]: x for x in rules.lanes()}.get(label) or lanes_now.get(label)
+                    lane = lane_named(label, rules)
                 elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
                     decision = "change the kind of approved work"
                 elif label == MARK and is_open and cur != "proposed":
@@ -4099,8 +4150,8 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
                 if sl["doing"] in labels and not guard_permitted(rules, actor, lane, issue, past):
                     # An agent finishing under YOLO closes its task itself. The guard checks the chain once, as it was
                     # just before the close, and marks what it found legitimate, so later changes to the chain never
-                    # turn the verdict.
-                    if YOLO_STOP_LABEL in labels:
+                    # turn the verdict. An outsider closing the issue they opened finishes nothing.
+                    if YOLO_STOP_LABEL in labels or actor not in rules.team and guard_restricted(rules, actor, issue):
                         pass  # YOLO stops before it: a person reviews it, whatever is marked
                     elif yolo_marked(events, position[id(e)]):
                         decision = None
@@ -4112,8 +4163,12 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
             elif kind == "reopened" and not is_open and \
                     (legit["reason"] == "completed" or legit["closed_from"] not in (None, "proposed")):
                 decision = "reopen closed work"  # done, or rejected after it was approved
+        if decision and also and guard_permitted(rules, actor, lane, issue, past) and \
+                not guard_permitted(rules, actor, also, issue, past):
+            lane = also
         if decision and not guard_permitted(rules, actor, lane, issue, past):
             violations.append((e, decision, lane))
+            snap(e)
             continue
         if kind == "labeled":
             labels.add(label)
@@ -4128,7 +4183,34 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
             legit.update(open=False, reason=reason)
         elif kind == "reopened":
             legit.update(open=True, reason=None, closed_from=None)
+        snap(e)
     return legit, violations
+
+
+def replay_at(hub, issue, events, until=None, before=None):
+    """The legitimate state of an issue at a cut of its timeline (its events up to `until`, or before the event
+    numbered `before`), as guard_replay(depth=1) leaves it: one replay of each issue per run answers every cut."""
+    memo = hub.__dict__.setdefault("_guard_memo", {})
+    key = ("states", issue["number"], id(events))
+    if key not in memo:
+        trace = []
+        guard_replay(hub, issue, events, depth=1, trace=trace)
+        # Running maxima, so the first event past a cut is found by bisection even where stamps tie or step back.
+        tops, top_t, top_i = ([], []), float("-inf"), float("-inf")
+        for t, eid, _ in trace[1:]:
+            top_t = max(top_t, t.timestamp()) if t else top_t
+            top_i = max(top_i, eid) if isinstance(eid, int) else top_i
+            tops[0].append(top_t)
+            tops[1].append(top_i)
+        memo[key] = (events, trace, tops)
+    _, trace, (tmax, imax) = memo[key]
+    cut = len(tmax)
+    if until:
+        cut = min(cut, bisect.bisect_right(tmax, until.timestamp()))
+    if before is not None:
+        cut = min(cut, bisect.bisect_left(imax, before))
+    state = trace[cut][2]
+    return dict(state, labels=set(state["labels"]), grants=dict(state["grants"]), marks=[])
 
 
 def yolo_grant_reaches(hub, grant, lane, issue):
@@ -4158,8 +4240,8 @@ def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None, reach=False
     for i in issues.values():
         if not {YOLO_LABEL, YOLO_STOP_LABEL} & set(i["labels"]) or i["number"] == n:
             continue
-        legit, _ = guard_replay(hub, i, guard_events(hub, i["number"]), depth=1,
-                                until=None if isinstance(event_id, int) else when, before=event_id)
+        legit = replay_at(hub, i, guard_events(hub, i["number"]),
+                          until=None if isinstance(event_id, int) else when, before=event_id)
         state = board_state(legit["labels"], legit["open"], legit["reason"])
         if state is not None and {YOLO_LABEL, YOLO_STOP_LABEL} & legit["labels"]:
             heads[i["number"]] = (legit, state)
@@ -4223,10 +4305,81 @@ def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None, reach=False
     return covered
 
 
+def decision_line(ticket, gist):
+    """The line a decision ticket that is done adds to its map's Decisions so far."""
+    return f"- [{ticket['title']}]({ticket.get('url') or '#' + str(ticket['number'])}): {gist}"
+
+
+def resolution_gist(hub, ticket, until=None):
+    """The gist of a ticket's latest answer (a resolution note from the team), as of `until`."""
+    for c in reversed(hub.tracker.list_comments(ticket["number"])):
+        note = parse_note(c, hub.team)
+        at = parse_iso(note.get("at"))
+        if until and at and at > until:
+            continue
+        if note.get("kind") == "resolution" and not note.get("external") and note["text"].startswith("Resolution:"):
+            answer = note["text"][len("Resolution:"):].strip()
+            return K._gist(answer) if answer else "resolved"
+    return "resolved"
+
+
+def decision_lines(hub, map_n):
+    """The Decisions so far lines an agent account may add to map `map_n`: one for each decision ticket of the map
+    that is done by its legitimate history, with each title it had and its answer as of its close."""
+    memo = hub.__dict__.setdefault("_guard_memo", {})
+    key = ("decisions", map_n)
+    if key in memo:
+        return memo[key]
+    out = set()
+    for ticket in guard_issues(hub):
+        if split_body(ticket["body"])[1].get("map") != map_n or ticket["number"] == map_n:
+            continue
+        events = guard_events(hub, ticket["number"])
+        legit, _ = guard_replay(hub, ticket, events)
+        if legit["open"] or legit["reason"] != "completed" or kind_in(legit["labels"]) not in DECISION_KINDS:
+            continue
+        closes = [parse_iso(e.get("created_at")) for e in events if e.get("event") == "closed"]
+        gist = resolution_gist(hub, ticket, until=closes[-1] if closes and closes[-1] else None)
+        titles = {ticket["title"]} | {e["rename"].get(x) for e in events if isinstance(e.get("rename"), dict)
+                                      for x in ("from", "to")}
+        out |= {decision_line(dict(ticket, title=title), gist) for title in titles if title}
+    memo[key] = out
+    return out
+
+
+def lines_of(text):
+    return [line.rstrip() for line in (text or "").split("\n") if line.strip()]
+
+
+def map_by_agent(hub, issue, good, new):
+    """An agent account's version of an approved map, kept where agents may write: its fog (Not yet specified) and
+    scope (Out of scope), and lines added to Decisions so far for decision tickets of the map that are done. The rest
+    is the people's. Returns (description, what was refused)."""
+    keep = good
+    for name in MAP_AGENT_SECTIONS:
+        keep = set_section(keep, name, section(new, name))
+    refused = []
+    old_d, new_d = lines_of(section(good, "Decisions so far")), lines_of(section(new, "Decisions so far"))
+    if old_d != new_d:
+        added = new_d[len(old_d):]
+        if new_d[:len(old_d)] == old_d and all(x in decision_lines(hub, issue["number"]) for x in added):
+            keep = set_section(keep, "Decisions so far", section(new, "Decisions so far"))
+        else:
+            refused.append("decisions")
+
+    def people_part(text):
+        return [(h.lower() if h else None, c) for h, c in sections(text)
+                if not h or h.lower() not in {x.lower() for x in MAP_AGENT_SECTIONS + ("Decisions so far",)}]
+    if people_part(new) != people_part(good):
+        refused.append("text")
+    return keep, refused
+
+
 def body_walk(hub, issue, events, steps, depth=0):
     """Walk a description's versions [(body, editor, time)], keeping what each author was allowed to change: on
-    approved work, agent accounts and outsiders change neither its description nor its map nor drop its links,
-    and only approvers link more work into a YOLO chain. Returns (description, meta, what was refused)."""
+    approved work, agent accounts and outsiders change neither its description (of a map, only its fog, its scope
+    and the decisions of its tickets that are done) nor its map nor drop its links, and only approvers link more
+    work into a YOLO chain. Returns (description, meta, what was refused); at depth 1, only its links count."""
     def then(t, seq):
         """Where to cut the timeline for a version: after the events before it (by the file hub's sequence), or,
         on GitHub, before its second, so a change in the same second as a chain's start is not counted against it."""
@@ -4234,41 +4387,41 @@ def body_walk(hub, issue, events, steps, depth=0):
             return {"before": seq}
         return {"until": t - timedelta(seconds=1)} if t else {}
 
-    def approved_at(t, seq=None):
-        return legit_approved(guard_replay(hub, issue, events, depth=1, **then(t, seq))[0])
-
     def chain_at(t, seq=None):
         """Whether the issue was in a YOLO chain then: links made before a chain existed are not links into it.
         (At depth 1, the chain's own links are taken as they are, so this never recurses further.)"""
         if t is None and seq is None:
             return hub.in_yolo_chain(issue)
         cut = then(t, seq)
-        own = guard_replay(hub, issue, events, depth=1, **cut)[0]["labels"]
+        own = replay_at(hub, issue, events, **cut)["labels"]
         return bool({YOLO_LABEL, YOLO_STOP_LABEL} & own) or \
             yolo_covered_at(hub, issue["number"], cut.get("until") or t, event_id=cut.get("before"), depth=1, lane=None)
 
     undone = []
-    lanes = {x["label"]: x for x in hub.lanes()}
     good_desc, good_meta = split_body(steps[0][0])
     for body, editor, t, seq in [tuple(x) + (None,) * (4 - len(x)) for x in steps[1:]]:
         if editor in TRUSTED_BOTS:
             continue  # the guard's own writes put back a good version; they never make a new one
         r_desc, r_meta = split_body(body)
         rules = hub.at(t)
-        state_then = guard_replay(hub, issue, events, depth=1, **then(t, seq))[0] if (t or seq is not None) else None
+        state_then = replay_at(hub, issue, events, **then(t, seq)) if (t or seq is not None) else None
         approved = legit_approved(state_then) if state_then else True
-        kind_then = next((x[len(KIND_PREFIX):] for x in (state_then or {"labels": set(issue["labels"])})["labels"]
-                          if x.startswith(KIND_PREFIX)), "build")
-        lane = next((lanes[x] for x in (state_then or {"labels": set(issue["labels"])})["labels"] if x in lanes), None)
+        labels_then = state_then["labels"] if state_then else set(issue["labels"])
+        lane = guard_lane_in(hub, rules, labels_then)
         restricted = guard_restricted(rules, editor, issue)
-        if approved and restricted:
-            if r_desc != good_desc and kind_then == "map":
-                # agents chart fog and scope; the destination and notes are the people's
-                for name in ("Destination", "Notes"):
-                    if section(r_desc, name) != section(good_desc, name):
-                        undone.append(f"rewrite a map's {name.lower()} by @{editor}")
-                    r_desc = set_section(r_desc, name, section(good_desc, name))
-                good_desc = r_desc
+        if depth:
+            pass  # what the links were is all a depth-1 walk is asked
+        elif approved and restricted:
+            if r_desc != good_desc and kind_in(labels_then) == "map":
+                kept, refused = map_by_agent(hub, issue, good_desc, r_desc)
+                if refused and kept != good_desc and len(join_body(kept, dict(good_meta, **r_meta))) > BODY_LIMIT - 1024:
+                    # the agent's part beside the people's would be too long for GitHub to take: the last good
+                    # version stays whole (an agent's own version, nothing refused, is as long as it wrote it)
+                    kept, refused = good_desc, refused + ["long"]
+                words = {"decisions": "rewrite a map's decisions", "text": "rewrite a map's text outside its fog and scope",
+                         "long": "make a map too long to keep the people's text in it"}
+                undone += [f"{words[x]} by @{editor}" for x in dict.fromkeys(refused)]
+                good_desc = kept
             elif r_desc != good_desc:
                 undone.append(f"rewrite approved work by @{editor}")
             if r_meta.get("map") != good_meta.get("map"):
@@ -4311,27 +4464,35 @@ def legit_deps(hub, issue):
 def deps_at(hub, issue, when=None, seq=None):
     """An issue's dependencies at a moment, from its edit history: what its bodies held then, less nothing an
     agent account was refused to remove from approved work (so unlinking first never makes a later link look like
-    one made outside a chain). Without the history, its own now."""
+    one made outside a chain). Without the history, its own now. The history is walked once per run."""
     revisions = guard_revisions(hub, issue["number"]) or []
     if not revisions:
         return split_body(issue["body"])[1].get("deps") or []
-    events = guard_events(hub, issue["number"])
-    deps = list(split_body(revisions[0].get("body"))[1].get("deps") or [])
-    for r in revisions[1:]:
-        if isinstance(seq, int) and isinstance(r.get("seq"), int):
-            if r["seq"] >= seq:
-                break
-        elif when and (parse_iso(r.get("at")) or when) >= when:
-            break
-        new = list(split_body(r.get("body"))[1].get("deps") or [])
-        editor, t = login_of(r.get("editor")), parse_iso(r.get("at"))
-        removed = [d for d in deps if d not in new]
-        if removed and editor not in TRUSTED_BOTS and guard_restricted(hub.at(t), editor, issue):
-            cut = {"before": r["seq"]} if isinstance(r.get("seq"), int) else {"until": t - timedelta(seconds=1)} if t else {}
-            if legit_approved(guard_replay(hub, issue, events, depth=1, **cut)[0]):
-                new += removed
-        deps = new
-    return deps
+    memo = hub.__dict__.setdefault("_guard_memo", {})
+    key = ("deps_at", issue["number"])
+    if key not in memo:
+        events = guard_events(hub, issue["number"])
+        deps = list(split_body(revisions[0].get("body"))[1].get("deps") or [])
+        line = [(None, None, deps)]
+        for r in revisions[1:]:
+            new = list(split_body(r.get("body"))[1].get("deps") or [])
+            editor, t = login_of(r.get("editor")), parse_iso(r.get("at"))
+            removed = [d for d in deps if d not in new]
+            if removed and editor not in TRUSTED_BOTS and guard_restricted(hub.at(t), editor, issue):
+                cut = {"before": r["seq"]} if isinstance(r.get("seq"), int) else {"until": t - timedelta(seconds=1)} if t else {}
+                if legit_approved(replay_at(hub, issue, events, **cut)):
+                    new += removed
+            deps = new
+            line.append((r.get("seq"), t, deps))
+        memo[key] = line
+    line = memo[key]
+    for i, (r_seq, r_at, _) in enumerate(line[1:], 1):
+        if isinstance(seq, int) and isinstance(r_seq, int):
+            if r_seq >= seq:
+                return list(line[i - 1][2])
+        elif when and (r_at or when) >= when:
+            return list(line[i - 1][2])
+    return list(line[-1][2])
 
 
 def guard_texts(hub, issue, events, edit=None):
@@ -4341,7 +4502,7 @@ def guard_texts(hub, issue, events, edit=None):
     fixes, undone, pulled = {}, [], set()
 
     def approved_at(t):
-        return legit_approved(guard_replay(hub, issue, events, until=t, depth=1)[0])
+        return legit_approved(replay_at(hub, issue, events, until=t))
 
     # Titles: GitHub keeps every rename with its author.
     renames = [e for e in events if e.get("event") == "renamed" and isinstance(e.get("rename"), dict)]
@@ -4372,8 +4533,16 @@ def guard_texts(hub, issue, events, edit=None):
     good_desc, good_meta, walked = body_walk(hub, issue, events, steps)
     undone += walked
     desc, meta = split_body(issue["body"])
-    live = {i["number"] for i in guard_issues(hub) if hub.state_of(i) is not None}
-    deps = sorted(d for d in good_meta.get("deps") or [] if d in live or d in (meta.get("deps") or []))
+    issues = {i["number"]: i for i in guard_issues(hub)}
+
+    def live(d):
+        """Whether a link to `d` is worth putting back: `d` is not rejected by its legitimate history (a rejection
+        the guard undoes leaves it live, whichever issue a sweep judges first)."""
+        if d not in issues:
+            return False
+        legit = replay_at(hub, issues[d], guard_events(hub, d))
+        return board_state(legit["labels"], legit["open"], legit["reason"]) is not None
+    deps = sorted(d for d in good_meta.get("deps") or [] if d in (meta.get("deps") or []) or live(d))
     pulled = set(meta.get("deps") or []) - set(deps)
     new_meta = dict(good_meta, deps=deps, map=good_meta.get("map"))
     body = join_body(good_desc, new_meta)
@@ -4440,9 +4609,12 @@ def guard_reconcile(hub, n, edit=None):
     lines += [f"- {u}" for u in text_undone] if text_fixes else []
     lines += [f"- {r}" for r in refused]
     if lines:
-        tracker.add_comment(n, render_note("Undid what only an approver may do:\n" + "\n".join(dict.fromkeys(lines)) +
-                                           f"\n\nThose decisions belong to {people(hub.approvers_for(issue)) or 'a person'}.",
-                                           Actor("signalbox-guard", False), "event"))
+        text = render_note("Undid what only an approver may do:\n" + "\n".join(dict.fromkeys(lines)) +
+                           f"\n\nThose decisions belong to {people(hub.approvers_for(issue)) or 'a person'}.",
+                           Actor("signalbox-guard", False), "event")
+        last = (tracker.list_comments(n) or [{}])[-1]
+        if (last.get("body") or "").replace("\r\n", "\n").strip() != text.strip():
+            tracker.add_comment(n, text)  # the same words again (a write GitHub keeps refusing) would only be noise
     for d in sorted(pulled):  # what a refused YOLO link pulled in is judged again, now without it
         try:
             guard_reconcile(hub, d)
@@ -4476,16 +4648,25 @@ def guard_sweep(hub, days=1):
     for e in hub.tracker.repo_events(since):
         if e.get("event") in ("closed", "reopened", "renamed") or guard_managed(e.get("label")):
             numbers.add(e["issue"])
-    for n in sorted(numbers):
-        try:
-            done = guard_reconcile(hub, n)
-        except Exception as e:  # one issue's trouble, whatever it is, never stops the others
-            errors.append(f"#{n}: {type(e).__name__}: {e}")
-            guard_fresh(hub)
-            continue
-        if done:
-            out.append(done)
-            guard_fresh(hub)
+    # One issue's fix can change the verdict on another judged before it (a chain link put back makes a link into
+    # it one into a chain), so the sweep goes round again while a pass still undoes something, three times at most.
+    for _ in range(3):
+        undone, failed = False, set()
+        for n in sorted(numbers):
+            try:
+                done = guard_reconcile(hub, n)
+            except Exception as e:  # one issue's trouble, whatever it is, never stops the others
+                errors.append(f"#{n}: {type(e).__name__}: {e}")
+                failed.add(n)
+                guard_fresh(hub)
+                continue
+            if done:
+                out.append(done)
+                undone = True
+                guard_fresh(hub)
+        numbers -= failed  # an error is reported once, not once a pass
+        if not undone:
+            break
     return out, errors
 
 
@@ -4589,7 +4770,7 @@ def cmd_init(args):
             create(os.path.join(".github", "workflows", "signalbox-guard.yml"), f.read())
     for m in made:
         print(f"Created {m}")
-    print(f"Installed the agent skill in .agents/skills/signalbox/ (and .claude/skills/signalbox/ for Claude Code)")
+    print("Installed the agent skill in .agents/skills/signalbox/ (and .claude/skills/signalbox/ for Claude Code)")
     hub = Hub(project, make_tracker(project, project.config), interactive=person_present())
     try:
         hub.ensure_labels()
