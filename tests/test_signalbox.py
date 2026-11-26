@@ -787,7 +787,13 @@ class GuardVerify(World):
         self.chain_with_a_proposal()  # the edit's run has not happened yet
         bot = dict(user="acme-bot", agent="claude-code")
         self.sb("claim", "SB-3", "--no-worktree", **bot)
-        self.assertIn("doing -> done", self.sb("finish", "SB-3", "-m", "Done", **bot))
+        # The CLI judges coverage as the guard does, so the refused link takes nobody past review here either.
+        self.assertIn("doing -> review", self.sb("finish", "SB-3", "-m", "Done", **bot))
+        self.assertIsNone(self.guard(3, label="sb:review"))
+        # And closing it straight on GitHub, as the link stands unjudged, is undone.
+        t = self.as_("acme-bot")
+        t.add_labels(3, ["sb:doing"])
+        t.update_issue(3, state="closed", state_reason="completed")
         self.assertIn("undid mark done", self.guard(3, "closed"))
         self.assertNotEqual(self.state("SB-3"), "done")
         self.assertNotIn(S.YOLO_DONE_LABEL, self.labels(3))
@@ -1209,6 +1215,116 @@ class GuardVerifyFourth(World):
             t.update_issue(2, body=S.join_body(d, dict(m, deps=[first + k])))
             self.assertIn("link work into a YOLO chain", self.guard(2, "edited", sender="acme-bot"))
         self.assertLess(time.time() - started, 20)
+
+
+class GuardVerifyFifth(World):
+    """The fifth verification of the guard: each scenario as the reviewer wrote it."""
+
+    config = {"approvers": ["alice"], "agents": {"logins": ["acme-bot"]},
+              "lanes": [{"name": "Platform", "prefix": "PL", "owners": ["alice"]}, {"name": "Docs", "prefix": "DC"},
+                        {"name": "Ops", "prefix": "OP", "owners": ["dave"]}]}
+    as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
+    bot = dict(user="acme-bot", agent="claude-code")
+
+    def gh(self):
+        return self.hub(user="github-actions[bot]")
+
+    def edit_deps(self, n, deps):
+        t = self.as_("acme-bot")
+        before = t.get_issue(n)
+        d, m = S.split_body(before["body"])
+        t.update_issue(n, body=S.join_body(d, dict(m, deps=deps)))
+        return {"body": {"from": before["body"]}}
+
+    def test_no_link_into_a_chain_a_lane_owner_turned_on(self):
+        self.sb("propose", "Ops", "Member", **self.bot)
+        self.sb("propose", "Ops", "Extra work", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", user="dave", tty=True)
+        self.sb("propose", "Ops", "Head", "--deps", "SB-1", user="dave", tty=True)
+        self.sb("yolo", "SB-3", "on", user="dave", tty=True)
+        changes = self.edit_deps(1, [2])
+        self.assertIn("link work into a YOLO chain", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        self.assertIn("doing -> review", self.sb("finish", "SB-2", "-m", "Done", **self.bot))
+
+    def test_unlinking_first_does_not_open_a_way_in(self):
+        self.sb("propose", "Docs", "A member", **self.bot)
+        self.sb("propose", "Docs", "X work", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("propose", "Docs", "Head", "--deps", "SB-1", tty=True)
+        self.sb("yolo", "SB-3", "on", tty=True)
+        ch = self.edit_deps(3, [])  # the head lets go of A (refused)...
+        ca = self.edit_deps(1, [2])  # ...and A, now "outside" the chain, waits on X
+        self.guard(3, "edited", sender="acme-bot", changes=ch)
+        self.assertIn("link work into a YOLO chain", self.guard(1, "edited", sender="acme-bot", changes=ca))
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        self.assertIn("doing -> review", self.sb("finish", "SB-2", "-m", "Done", **self.bot))
+
+    def test_a_padded_rewrite_is_put_back_whole(self):
+        long_desc = "Write the install guide.\n" + "\n".join(f"- step {i}: run the installer and check it" for i in range(70))
+        self.sb("propose", "Docs", "Write the guide", long_desc, **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        t = self.as_("acme-bot")
+        meta = S.split_body(t.get_issue(1)["body"])[1]
+        padded = S.join_body("Do nothing.", dict(meta, pad="x" * 60000))
+        self.assertNotIn("pad", S.split_body(padded)[1])  # only what Signalbox writes rides in the meta
+        t.update_issue(1, title="Nothing", body=padded)
+        real = S.FileTracker.update_issue
+
+        def github_limit(self_, number, **fields):
+            if len(fields.get("body") or "") > 65536:
+                raise S.SignalboxError("GitHub refused PATCH: 422 body is too long")
+            return real(self_, number, **fields)
+        with mock.patch.object(S.FileTracker, "update_issue", github_limit):
+            self.assertIn("rewrite approved work", self.guard(1, "edited", sender="acme-bot"))
+        after = t.get_issue(1)
+        self.assertEqual((after["title"], S.split_body(after["body"])[0]), ("Write the guide", long_desc))
+
+    def test_two_yolo_heads_agree_whatever_the_listing_order(self):
+        self.sb("propose", "Docs", "Docs work", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("propose", "Docs", "Docs head", "--deps", "SB-1", tty=True)
+        self.sb("yolo", "SB-2", "on", tty=True)
+        self.sb("propose", "Ops", "Ops head", "--deps", "SB-1", user="dave", tty=True)
+        self.sb("yolo", "SB-3", "on", user="dave", tty=True)
+        self.sb("claim", "SB-1", "--no-worktree", **self.bot)
+        real = S.FileTracker.list_issues
+        with mock.patch.object(S.FileTracker, "list_issues", lambda self_, label=S.MARK, since=None: list(reversed(real(self_, label, since)))):
+            self.assertIn("doing -> done", self.sb("finish", "SB-1", "-m", "Done", **self.bot))
+            self.assertEqual(self.guard(1, "closed"), "marked #1 done under YOLO")
+
+    def test_a_second_finish_under_yolo_is_marked_too(self):
+        self.sb("propose", "Docs", "D", **self.bot)
+        self.sb("propose", "Docs", "Head", "--deps", "SB-1", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("yolo", "SB-2", "on", tty=True)
+        for _ in range(2):
+            self.sb("claim", "SB-1", "--no-worktree", **self.bot)
+            self.sb("finish", "SB-1", "-m", "Done", **self.bot)
+            self.assertEqual(self.guard(1, "closed"), "marked #1 done under YOLO")
+            if _ == 0:
+                hub = self.hub(tty=True)
+                old = hub.write_mirror()
+                new = json.loads(json.dumps(old))
+                next(x for x in new["tasks"] if x["id"] == "SB-1")["state"] = "todo"  # alice: again, please
+                hub.invalidate()
+                hub.apply_board(K.parse_board(K.dumps(old)), K.parse_board(K.dumps(new)))
+        self.sb("undepend", "SB-2", "SB-1", tty=True)  # alice changes the chain later
+        self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+        self.assertEqual(self.state("SB-1"), "done")
+
+    def test_the_config_history_is_the_main_lines(self):
+        self.sb("propose", "Docs", "D", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        wt = json.JSONDecoder().raw_decode(self.sb("--json", "claim", "SB-1", **self.bot))[0]["worktree"]
+        cfg_path = os.path.join(wt, ".signalbox", "config.json")  # the task branch dates a config of its own
+        cfg = json.loads(read(cfg_path))
+        cfg["approvers"] = ["acme-bot"]
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        sh("git", "commit", "-qam", "my own rules", cwd=wt)
+        hub = S.Hub(S.Project(wt), self.hub().tracker, S.Actor("x", True))
+        self.assertEqual(hub.at(S.now()).config["approvers"], ["alice"])
 
 
 class Security(World):
