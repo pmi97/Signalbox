@@ -27,8 +27,8 @@ concurrency:
 jobs:
   guard:
     # Also when the signalbox label itself goes, so taking a task off the board is seen too.
-    # Edits run whatever the labels say: an issue taken off the board is still judged as the board issue it was.
-    if: github.event_name == 'schedule' || github.event.action == 'edited' || contains(github.event.issue.labels.*.name, 'signalbox') || github.event.label.name == 'signalbox'
+    # Every issue event, whatever its labels: an issue taken off the board is still judged as the board issue it
+    # was, and one that never was is left at once.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

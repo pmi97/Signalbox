@@ -894,6 +894,115 @@ class GuardVerify(World):
             hub.apply_board(K.parse_board(K.dumps(old)), K.parse_board(K.dumps(new)))
 
 
+class GuardVerifyAgain(World):
+    """The second verification of the guard: each scenario as the reviewer wrote it."""
+
+    config = {"approvers": ["alice"], "agents": {"logins": ["acme-bot"]}}
+    as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
+    bot = dict(user="acme-bot", agent="claude-code")
+
+    def gh(self):
+        return self.hub(user="github-actions[bot]")
+
+    def test_links_made_before_a_chain_existed_stay_when_yolo_comes(self):
+        self.sb("propose", "Docs", "Base", **self.bot)
+        self.sb("propose", "Docs", "Head", **self.bot)
+        self.sb("depend", "SB-2", "SB-1", **self.bot)  # agents rewire proposals; no chain exists yet
+        self.sb("yolo", "SB-2", "on", tty=True)
+        self.assertIsNone(self.guard(2, label="sb:yolo"))
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(2)["body"])[1]["deps"], [1])
+        self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+
+    def test_a_task_yolo_stops_before_is_never_done_under_yolo(self):
+        self.sb("propose", "Docs", "Base", **self.bot)
+        self.sb("propose", "Docs", "Checkpoint", "--deps", "SB-1", **self.bot)
+        self.sb("propose", "Docs", "Head", "--deps", "SB-2", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", "SB-3", tty=True)
+        self.sb("yolo", "SB-3", "on", tty=True)
+        self.sb("yolo", "SB-2", "stop", tty=True)  # a person reviews SB-2 before the chain goes on
+        self.sb("claim", "SB-1", "--no-worktree", **self.bot)
+        self.sb("finish", "SB-1", "-m", "Done", **self.bot)
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        t = self.as_("acme-bot")
+        t.remove_label(2, "sb:yolo-stop")
+        t.update_issue(2, state="closed", state_reason="completed")
+        t.remove_label(2, "sb:doing")
+        out = self.guard(2, "closed")
+        self.assertIn("undid mark done", out)
+        self.assertNotIn(S.YOLO_DONE_LABEL, self.labels(2))
+        self.assertIn("sb:yolo-stop", self.labels(2))
+        self.assertNotEqual(self.as_("alice").get_issue(2)["state"], "closed")
+
+    def test_work_taken_off_the_board_is_found_by_the_sweep(self):
+        self.sb("propose", "Docs", "Prereq", **self.bot)
+        self.sb("propose", "Docs", "After", "--deps", "SB-1", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        bot = self.as_("acme-bot")
+        bot.remove_label(1, "signalbox")  # its run is lost
+        bot.update_issue(1, state="closed", state_reason="completed")
+        out, errors = S.guard_sweep(self.gh())
+        self.assertEqual(errors, [])
+        self.assertTrue(any("take approved work off the board" in o for o in out))
+        issue = bot.get_issue(1)
+        self.assertEqual((issue["state"], "signalbox" in issue["labels"]), ("open", True))
+
+    def test_a_run_reads_no_comments_and_lists_the_board_once(self):
+        spec = {"tasks": [{"title": f"Task {i}", "lane": "Docs"} for i in range(40)]}
+        self.sb("batch", stdin=json.dumps(spec), **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("edit", "SB-1", "--desc", "changed", tty=True)
+        self.as_("acme-bot").add_labels(1, ["bug"])
+        calls = {}
+        names = ["list_issues", "list_comments", "list_events"]
+        reals = {k: getattr(S.FileTracker, k) for k in names}
+
+        def counting(k):
+            def f(self_, *a, **kw):
+                calls[k] = calls.get(k, 0) + 1
+                return reals[k](self_, *a, **kw)
+            return f
+        patches = [mock.patch.object(S.FileTracker, k, counting(k)) for k in names]
+        for p_ in patches:
+            p_.start()
+        try:
+            self.guard(1, label="bug")
+        finally:
+            for p_ in patches:
+                p_.stop()
+        self.assertEqual(calls.get("list_comments", 0), 0)
+        self.assertLessEqual(calls.get("list_issues", 0), 2)
+
+    def test_done_work_keeps_its_title_and_description(self):
+        self.sb("propose", "Docs", "Base", "Original description", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("claim", "SB-1", "--no-worktree", **self.bot)
+        self.sb("finish", "SB-1", "-m", "Done", **self.bot)
+        self.sb("accept", "SB-1", tty=True)
+        t = self.as_("acme-bot")
+        before = t.get_issue(1)
+        t.update_issue(1, title="Something else entirely", body=S.join_body("Rewritten by the agent", {}))
+        out = self.guard(1, "edited", sender="acme-bot", changes={"title": {"from": before["title"]}, "body": {"from": before["body"]}})
+        self.assertIn("change the title of approved work", out)
+        after = t.get_issue(1)
+        self.assertEqual((after["title"], S.split_body(after["body"])[0]), ("Base", "Original description"))
+
+    def test_a_persons_later_edit_is_never_undone_for_an_agents_earlier_one(self):
+        n = self.approved()
+        bot = self.as_("acme-bot")
+        before = bot.get_issue(n)
+        bot.update_issue(n, body="agent's text")
+        self.as_("alice").update_issue(n, body="alice's text")
+        with mock.patch.object(S.FileTracker, "body_revisions", lambda self_, number: None):  # history unreadable
+            hub = self.gh()
+            issue = hub.tracker.get_issue(n)
+            raw = {"number": n, "title": issue["title"], "body": "agent's text", "state": "open",
+                   "labels": [{"name": x} for x in issue["labels"]], "user": {"login": issue["user"]}}
+            out = S.guard_event(hub, {"action": "edited", "issue": raw, "sender": {"login": "acme-bot"},
+                                      "changes": {"body": {"from": before["body"]}}})
+        self.assertIsNone(out)
+        self.assertEqual(bot.get_issue(n)["body"], "alice's text")
+
+
 class Security(World):
     """Each test pins down a hole that was open: who may act as whom, what text agents trust, what reaches git."""
 
