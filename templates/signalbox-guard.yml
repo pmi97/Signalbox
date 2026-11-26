@@ -1,21 +1,25 @@
 # Signalbox guard: GitHub knows who made each change to an issue, so this workflow turns the board's human-only
 # decisions into rules. When an account that may not decide (an agent's bot account, or someone who is not an
-# approver of the task's lane) approves a proposal, sends work back, accepts or rejects it, demotes it, turns YOLO on
-# or removes a YOLO stop, takes a task off the board or puts approved work on it, or (for agent accounts) rewrites an
-# approved task, the guard undoes it and says why in a comment. Approvers and agent accounts are read from
-# .signalbox/config.json on the default branch, so a pull request cannot change them.
+# approver of the task's lane) approves a proposal, starts one, sends work back, accepts, rejects or reopens it,
+# demotes it, moves it between lanes or changes its kind, turns YOLO on or removes a YOLO stop, takes a task off the
+# board, or (for agent accounts) rewrites an approved task, the guard undoes it and says why in a comment.
+# Approvers and agent accounts are read from .signalbox/config.json on the default branch, so a pull request cannot
+# change them.
 name: signalbox-guard
 
 on:
   issues:
-    types: [labeled, unlabeled, closed, edited]
+    types: [labeled, unlabeled, closed, reopened, edited]
 
 permissions:
   issues: write
   contents: read
 
+# One run per issue at a time. GitHub may drop a waiting run when a newer one queues; that loses nothing, since
+# each run replays the issue's recent history with the account behind every change. Edits are judged from their
+# own event alone, so they get runs of their own that nothing cancels.
 concurrency:
-  group: signalbox-guard-${{ github.event.issue.number }}
+  group: signalbox-guard-${{ github.event.issue.number }}-${{ github.event.action == 'edited' && github.run_id || 'labels' }}
   cancel-in-progress: false
 
 jobs:

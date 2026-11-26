@@ -438,6 +438,14 @@ class FileTracker:
             write_file(self.path, json.dumps(data, indent=1, ensure_ascii=False) + "\n")
         return out
 
+    def _event(self, data, number, event, **extra):
+        """Keep the issue's timeline as GitHub does: who labelled, unlabelled, closed, reopened or renamed it."""
+        data.setdefault("events", {}).setdefault(str(number), []).append(
+            {"event": event, "actor": self.whoami(), "created_at": iso(now()), **extra})
+
+    def list_events(self, number):
+        return [dict(e) for e in self._read().get("events", {}).get(str(number), [])]
+
     def _issue(self, data, number):
         issue = data["issues"].get(str(number))
         if not issue:
@@ -465,17 +473,25 @@ class FileTracker:
                      "state": "open", "state_reason": None, "assignees": list(assignees), "user": self.whoami(),
                      "created_at": stamp, "updated_at": stamp, "url": f"{self.describe()}#{n}"}
             data["issues"][str(n)] = issue
+            for lab in issue["labels"]:
+                self._event(data, n, "labeled", label=lab)
             return dict(issue)
         return self._tx(fn)
 
     def update_issue(self, number, **fields):
         def fn(data):
             issue = self._issue(data, number)
+            before = dict(issue)
             for k, v in fields.items():
                 if k in ("title", "body", "state", "state_reason"):
                     issue[k] = v
             if fields.get("state") == "open":
                 issue["state_reason"] = None
+            if before["state"] != issue["state"]:
+                self._event(data, number, "closed" if issue["state"] == "closed" else "reopened",
+                            **({"state_reason": issue.get("state_reason") or "completed"} if issue["state"] == "closed" else {}))
+            if before["title"] != issue["title"]:
+                self._event(data, number, "renamed", rename={"from": before["title"], "to": issue["title"]})
             self._touch(issue)
             return dict(issue)
         return self._tx(fn)
@@ -483,6 +499,9 @@ class FileTracker:
     def add_labels(self, number, labels):
         def fn(data):
             issue = self._issue(data, number)
+            for lab in labels:
+                if lab not in issue["labels"]:
+                    self._event(data, number, "labeled", label=lab)
             issue["labels"] = list(dict.fromkeys(issue["labels"] + list(labels)))
             self._touch(issue)
         self._tx(fn)
@@ -492,6 +511,7 @@ class FileTracker:
             issue = self._issue(data, number)
             if label in issue["labels"]:
                 issue["labels"].remove(label)
+                self._event(data, number, "unlabeled", label=label)
                 self._touch(issue)
         self._tx(fn)
 
@@ -807,6 +827,21 @@ class GitHubTracker:
             return True
         except SignalboxError:
             return False
+
+    def list_events(self, number):
+        """The issue's timeline of label, close, reopen and rename events, oldest first, with who made each."""
+        out = []
+        for e in self.pages(f"/repos/{self.repo}/issues/{number}/events"):
+            item = {"event": e.get("event"), "actor": login_of((e.get("actor") or {}).get("login")),
+                    "created_at": e.get("created_at")}
+            if e.get("label"):
+                item["label"] = e["label"].get("name")
+            if e.get("state_reason"):
+                item["state_reason"] = e["state_reason"]
+            if e.get("rename"):
+                item["rename"] = e["rename"]
+            out.append(item)
+        return out
 
     def search_issues(self, q):
         payload, _ = self.call("GET", f"/search/issues?q={quote(q)}&per_page=100")
@@ -1809,6 +1844,8 @@ class Hub:
         if kind is not None:
             if kind not in KINDS:
                 raise SignalboxError(f"Unknown kind '{kind}'")
+            if state != "proposed" and kind != self.kind_of(issue):  # the kind decides checks and HITL pairing
+                self.require_approver(issue, "change the kind of an approved task")
             for lab in issue["labels"]:
                 if lab.startswith(KIND_PREFIX):
                     self.tracker.remove_label(issue["number"], lab)
@@ -1905,8 +1942,8 @@ class Hub:
             raise SignalboxError(f"{tid} is a proposal; a person must approve it before anyone starts it")
         if vs not in ("todo", "doing"):
             raise SignalboxError(f"{tid} cannot be claimed: it is {vs}")
-        if STATE_LABELS["proposed"] in issue["labels"] and vs != "todo" or \
-                vs == "doing" and not self.locks.get(n)[0] and not (self.actor.human and self.interactive):
+        if (STATE_LABELS["proposed"] in issue["labels"] or vs == "doing" and not self.locks.get(n)[0]) and \
+                not (self.actor.human and self.interactive):
             # In doing with no interlock, or still marked proposed: labels changed outside Signalbox, which may be an
             # approval no one made. A person looks at it first.
             raise SignalboxError(f"{tid} is in doing with no interlock, or still marked proposed: its labels were changed "
@@ -1941,8 +1978,9 @@ class Hub:
         if cur_sha:
             if self.holds(cur):
                 sha = self.locks.replace(n, cur_sha, {**cur, "expires": rec["expires"]})
-                return {"issue": issue, "sha": sha, "record": cur, "how": "already yours", "worktree": cur.get("worktree"),
-                        "branch": cur.get("branch"), "warnings": self.warnings}
+                return {"issue": issue, "sha": sha, "record": cur, "how": "already yours",
+                        "worktree": self.worktrees.owned(cur.get("worktree")), "branch": safe_branch(cur.get("branch")),
+                        "warnings": self.warnings}
             expired = lease_left(cur) <= 0
             if not take_over:
                 hint = (f" Its lease ran out {span(lease_left(cur))} ago: take it over with `{command('claim ' + tid + ' --take-over')}`."
@@ -3711,98 +3749,174 @@ def cmd_doctor(args):
 # decisions into rules even for clients that do not run Signalbox: an approval, acceptance or YOLO by someone who may
 # not decide is undone, with a comment saying why.
 
+GUARD_WINDOW = timedelta(minutes=30)
+
+
+def guard_managed(label):
+    """Labels whose changes are decisions or carry them. The lock mirror (sb:locked) is not one."""
+    label = label or ""
+    return label == MARK or label in LABEL_STATES or label in (YOLO_LABEL, YOLO_STOP_LABEL) or \
+        label.startswith(LANE_PREFIX) or label.startswith(KIND_PREFIX)
+
+
+def guard_replay(hub, issue, events, at=None):
+    """Replay an issue's timeline (label, close and reopen events, each with the account GitHub recorded) and keep
+    only the changes their authors may make. Returns (legit, violations): legit is {"labels", "open", "reason"} as the
+    issue would be without the refused changes; violations are [(event, decision)] inside the judged window.
+
+    Events are judged against the state the issue legitimately had when they happened, so no order of changes can
+    make an approval look like a pause, and a run that GitHub cancels only hands its events to the next run. Only
+    recent events are judged (GUARD_WINDOW, or everything since an issue came back onto the board): older ones were
+    judged when they happened, and judging them again against today's approvers or YOLO chains would undo decisions
+    that were right at the time."""
+    at = at or now()
+    sl, agents = STATE_LABELS, hub.team
+    lanes = {x["label"]: x for x in hub.lanes()}
+    order = [x["label"] for x in hub.lanes()]
+    author, outside_author = login_of(issue.get("user")), is_external(issue, agents)
+    tid = hub.tid(issue["number"]).upper()
+    start = at - GUARD_WINDOW
+    for i, e in enumerate(events):  # a task that came (back) onto the board is judged since it left it, or began
+        t = parse_iso(e.get("created_at"))
+        if e.get("event") == "labeled" and e.get("label") == MARK and t and t >= start:
+            left = [parse_iso(x.get("created_at")) for x in events[:i] if x.get("event") == "unlabeled" and x.get("label") == MARK]
+            start = min(start, left[-1]) if left and left[-1] else datetime(1970, 1, 1, tzinfo=timezone.utc)
+            break
+    legit = {"labels": set(), "open": True, "reason": None}
+    violations, cover = [], None
+
+    def state(labels):
+        present = [LABEL_STATES[x] for x in labels if x in LABEL_STATES]
+        return max(present, key=K.STATES.index) if present else "proposed"
+
+    def lane_in(labels):
+        return next((lanes[x] for x in order if x in labels), None)
+
+    def permitted(actor, lane):
+        if not actor or actor in agents or (actor == author and outside_author):
+            return False
+        allowed = hub.approvers_for_lane(lane)
+        return not allowed or actor in allowed
+
+    for e in events:
+        kind, actor, label = e.get("event"), login_of(e.get("actor")), e.get("label")
+        if kind in ("labeled", "unlabeled") and not guard_managed(label) or kind not in ("labeled", "unlabeled", "closed", "reopened"):
+            continue
+        labels, is_open = legit["labels"], legit["open"]
+        cur, lane, decision = state(labels), lane_in(labels), None
+        t = parse_iso(e.get("created_at"))
+        judged = actor not in TRUSTED_BOTS and (t is None or t >= start)  # the guard's own corrections stand
+        if judged and kind == "labeled":
+            if label == sl["todo"] and sl["doing"] not in labels:  # with doing: a pause or handoff
+                decision = "send back" if sl["review"] in labels else "approve" if cur == "proposed" else None
+            elif label == sl["doing"] and not (sl["todo"] in labels and sl["proposed"] not in labels):
+                decision = "start work no one approved"  # a claim moves todo to doing
+            elif label == sl["review"] and sl["doing"] not in labels:  # with doing: finish
+                decision = "move to review without doing the work"
+            elif label == YOLO_LABEL:
+                decision = "turn YOLO on"
+            elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
+                decision, lane = f"move approved work into lane {label[len(LANE_PREFIX):]}", lanes.get(label)
+            elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
+                decision = "change the kind of approved work"
+        elif judged and kind == "unlabeled":
+            if label in (sl["todo"], sl["doing"], sl["review"]) and is_open and cur != "proposed" and \
+                    state(labels - {label}) == "proposed":  # moves add the new state before taking the old one off
+                decision = "move approved work back to proposed"
+            elif label == YOLO_STOP_LABEL and is_open:
+                decision = "remove a YOLO stop"
+            elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
+                decision, lane = f"move approved work out of lane {label[len(LANE_PREFIX):]}", lanes.get(label)
+            elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
+                decision = "change the kind of approved work"
+            elif label == MARK and is_open and cur != "proposed":
+                decision = "take approved work off the board"
+        elif judged and kind == "closed" and is_open:
+            if (e.get("state_reason") or "completed") == "completed":
+                if sl["doing"] in labels:  # an agent finishing under YOLO closes its task itself
+                    cover = K.yolo_cover(hub.board()) if cover is None else cover
+                    via = cover.get(tid)
+                    decision = None if via and via.upper() != tid else "mark done"
+                else:
+                    decision = "mark done"
+            elif cur != "proposed":  # withdrawing a proposal is anyone's; rejecting approved work is not
+                decision = "reject"
+        elif judged and kind == "reopened" and not is_open and (cur != "proposed" or legit["reason"] == "completed"):
+            decision = "reopen closed work"
+        if decision and not permitted(actor, lane):
+            violations.append((e, decision))
+            continue
+        if kind == "labeled":
+            labels.add(label)
+        elif kind == "unlabeled":
+            labels.discard(label)
+        elif kind == "closed":
+            legit.update(open=False, reason=e.get("state_reason") or "completed")
+        elif kind == "reopened":
+            legit.update(open=True, reason=None)
+    return legit, violations
+
+
 def guard_event(hub, event):
-    """Undo a human-only decision made on GitHub by an account that may not make it. Returns what was undone."""
+    """Undo human-only decisions made on GitHub by accounts that may not make them. Returns what was undone."""
     issue_raw = event.get("issue") or {}
     sender = login_of((event.get("sender") or {}).get("login"))
     action = event.get("action")
-    if not issue_raw or not sender:
+    if not issue_raw:
         return None
-    issue = GitHubTracker._issue(issue_raw)
-    label = (event.get("label") or {}).get("name")
-    if MARK not in issue["labels"] and not (action == "unlabeled" and label == MARK):
-        return None
-    n = issue["number"]
+    n = issue_raw["number"]
     tracker = hub.tracker
-    labels = set(issue["labels"])
     agents = hub.team
-    present = [LABEL_STATES[x] for x in labels if x in LABEL_STATES]
-    prev = max(present, key=K.STATES.index) if present else "proposed"
-    sl = STATE_LABELS
+    if action == "edited":
+        return guard_edit(hub, event, sender)
+    issue = tracker.get_issue(n)  # now, not the event's snapshot: later changes may have come meanwhile
+    events = tracker.list_events(n)
+    legit, violations = guard_replay(hub, issue, events)
+    if not violations:
+        return None
+    current = {x for x in issue["labels"] if guard_managed(x)}
+    lane_touched = any(d.startswith("move approved work into lane") or d.startswith("move approved work out of lane")
+                       for _, d in violations)
+    want = {x for x in legit["labels"] if guard_managed(x) and (lane_touched or not x.startswith(LANE_PREFIX))}
+    have = {x for x in current if lane_touched or not x.startswith(LANE_PREFIX)}
     is_open = issue["state"] == "open"
-    shown = prev if is_open else ("done" if issue.get("state_reason") == "completed" else None)
-    yolo = labels & {YOLO_LABEL}
-
-    def reopen():
+    if want == have and legit["open"] == is_open:
+        return None  # what was refused is undone already, by an earlier run
+    if legit["open"] and not is_open:
         tracker.update_issue(n, state="open")
-        tracker.add_labels(n, [sl[prev]])
+    for lab in sorted(want - have):
+        tracker.add_labels(n, [lab])
+    for lab in sorted(have - want):
+        tracker.remove_label(n, lab)
+    if not legit["open"] and is_open:
+        tracker.update_issue(n, state="closed", state_reason=legit["reason"] or "completed")
+    # Name what this run undoes: the refused changes since the guard last corrected this issue.
+    position = {id(e): i for i, e in enumerate(events)}
+    fixed_at = max((i for i, e in enumerate(events) if login_of(e.get("actor")) in TRUSTED_BOTS), default=-1)
+    violations = [(e, d) for e, d in violations if position[id(e)] > fixed_at] or violations
+    lines = []
+    for e, decision in violations:
+        actor = login_of(e.get("actor")) or "someone"
+        who = "an agent account" if actor in agents else \
+            "outside the team" if actor == login_of(issue.get("user")) and is_external(issue, agents) else "not an approver here"
+        lines.append(f"- **{decision}** by @{actor}, who is {who}")
+    allowed_txt = people(hub.approvers_for(issue)) or "a person"
+    tracker.add_comment(n, render_note("Undid what only an approver may do:\n" + "\n".join(dict.fromkeys(lines)) +
+                                       f"\n\nThose decisions belong to {allowed_txt}.", Actor("signalbox-guard", False), "event"))
+    return "; ".join(dict.fromkeys(f"undid {d} by @{login_of(e.get('actor'))} on #{n}" for e, d in violations))
 
-    decision, undo, allowed = None, None, None
-    if action in ("labeled", "unlabeled") and str(label or "").startswith(LANE_PREFIX) and is_open and prev != "proposed":
-        # Approved work keeps the approvers it was approved by: it leaves a lane, or enters one, only with theirs.
-        lane = next((x for x in hub.lanes() if x["label"] == label), None)
-        allowed = hub.approvers_for_lane(lane)
-        if action == "labeled":
-            decision, undo = f"move approved work into lane {label[len(LANE_PREFIX):]}", lambda: tracker.remove_label(n, label)
-        else:
-            decision, undo = f"move approved work out of lane {label[len(LANE_PREFIX):]}", lambda: tracker.add_labels(n, [label])
-    elif action == "labeled" and label == sl["doing"] and (sl["proposed"] in labels or not labels & {sl["todo"], sl["review"]}):
-        # A claim adds doing next to todo; doing on a proposal starts work no one approved.
-        decision = "start a proposal"
 
-        def undo():
-            tracker.remove_label(n, sl["doing"])
-            tracker.add_labels(n, [sl["proposed"]])
-    elif action == "unlabeled" and label == MARK:
-        # Taking an approved task off the board, perhaps to change it unguarded and put it back.
-        if shown not in (None, "proposed"):
-            decision, undo = "take approved work off the board", lambda: tracker.add_labels(n, [MARK])
-    elif action == "labeled" and label == MARK:
-        # Putting an issue on the board, or back: it comes as a proposal unless an approver puts it there.
-        if shown not in (None, "proposed") or yolo:
-            decision = "put approved work on the board"
-
-            def undo():
-                if not is_open:
-                    tracker.update_issue(n, state="open")
-                for lab in (labels & ({sl["todo"], sl["doing"], sl["review"]} | yolo)):
-                    tracker.remove_label(n, lab)
-                tracker.add_labels(n, [sl["proposed"]])
-    elif action == "unlabeled" and label in (sl["todo"], sl["doing"], sl["review"]) and is_open and prev == "proposed":
-        # Moves add the new state before taking the old one off, so this leaves the task a proposal: a demotion that
-        # would let a rejection pass for a withdrawal.
-        decision = "move approved work back to proposed"
-
-        def undo():
-            tracker.add_labels(n, [label])
-            if sl["proposed"] in labels:
-                tracker.remove_label(n, sl["proposed"])
-    elif action == "labeled" and label == sl["todo"] and sl["doing"] not in labels:  # with doing: a pause or handoff
-        if sl["review"] in labels:
-            decision, undo = "send back", lambda: tracker.remove_label(n, sl["todo"])
-        else:  # from a proposal, or from no state at all
-            decision = "approve"
-            undo = lambda: (tracker.remove_label(n, sl["todo"]), tracker.add_labels(n, [sl["proposed"]]))
-    elif action == "labeled" and label == sl["review"] and sl["doing"] not in labels:  # with doing: finish
-        decision = "move to review without claiming it"
-
-        def undo():
-            tracker.remove_label(n, sl["review"])
-            if not labels & {sl["proposed"], sl["todo"]}:
-                tracker.add_labels(n, [sl["proposed"]])
-    elif action == "labeled" and label == YOLO_LABEL:
-        decision, undo = "turn YOLO on", lambda: tracker.remove_label(n, YOLO_LABEL)
-    elif action == "unlabeled" and label == YOLO_STOP_LABEL and issue["state"] == "open":  # lets YOLO run through it
-        decision, undo = "remove a YOLO stop", lambda: tracker.add_labels(n, [YOLO_STOP_LABEL])
-    elif action == "closed" and issue.get("state_reason") == "completed":
-        via = None
-        if sl["doing"] in labels:  # an agent finishing under YOLO closes its task itself
-            via = K.yolo_cover(hub.board()).get(hub.tid(n).upper())
-        if not (via and via.upper() != hub.tid(n).upper()):
-            decision, undo = "mark done", reopen
-    elif action == "closed" and prev != "proposed":  # withdrawing a proposal is anyone's; rejecting work is not
-        decision, undo = "reject", reopen
-    elif action == "edited" and sender in agents and prev != "proposed":
+def guard_edit(hub, event, sender):
+    """An agent account rewriting an approved task's title, description or dependencies: put them back."""
+    issue = GitHubTracker._issue(event.get("issue") or {})
+    if MARK not in issue["labels"]:
+        return None
+    n, tracker, agents = issue["number"], hub.tracker, hub.team
+    action = event.get("action")
+    present = [LABEL_STATES[x] for x in issue["labels"] if x in LABEL_STATES]
+    prev = max(present, key=K.STATES.index) if present else "proposed"
+    decision, undo = None, None
+    if action == "edited" and sender in agents and prev != "proposed":
         fixes, changes = {}, event.get("changes") or {}
         if "title" in changes and (changes["title"] or {}).get("from") is not None:
             fixes["title"] = changes["title"]["from"]
@@ -3825,17 +3939,9 @@ def guard_event(hub, event):
             decision, undo = "change an approved task", lambda: tracker.update_issue(n, **fixes)
     if not decision:
         return None
-    if allowed is None:
-        allowed = hub.approvers_for(issue)
-    # Someone outside the team can close the issues they opened; on the board that would be a decision.
-    outsider = sender == login_of(issue.get("user")) and is_external(issue, agents)
-    if sender not in agents and not outsider and (not allowed or sender in allowed):
-        return None
     undo()
-    who = "an agent account" if sender in agents else "outside the team" if outsider else "not an approver here"
-    allowed_txt = people(allowed) or "a person"
-    tracker.add_comment(n, render_note(f"Undid **{decision}** by @{sender}, who is {who}. That decision belongs to "
-                                       f"{allowed_txt}.", Actor("signalbox-guard", False), "event"))
+    tracker.add_comment(n, render_note(f"Undid **{decision}** by @{sender}, who is an agent account. Only people change "
+                                       "approved tasks.", Actor("signalbox-guard", False), "event"))
     return f"undid {decision} by @{sender} on #{n}"
 
 

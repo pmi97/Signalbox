@@ -491,16 +491,21 @@ class BrowserSaves(World):
 
 
 class Guard(World):
+    """The guard replays an issue's history with the account GitHub recorded for each change. Here every change is
+    made by the account that makes it in the story: acme-bot is an agent account, carol a collaborator who is not an
+    approver, alice the approver; the guard itself acts as github-actions[bot]."""
+
     config = {"approvers": ["alice"], "agents": {"logins": ["acme-bot"]}}
 
-    def event(self, action, number, sender, label=None, reason=None, changes=None):
-        hub = self.hub()
-        issue = hub.tracker.get_issue(number)
-        raw = {"number": number, "id": issue["id"], "title": issue["title"], "body": issue["body"],
-               "labels": [{"name": x} for x in issue["labels"]], "state": issue["state"], "state_reason": reason,
-               "assignees": [], "user": {"login": "alice"}}
-        if action == "labeled" and label and label not in issue["labels"]:  # unlabeled payloads lack the label
-            raw["labels"].append({"name": label})
+    def as_(self, user):
+        return self.hub(user=user).tracker
+
+    def guard(self, n, action="labeled", label=None, sender="someone", changes=None):
+        hub = self.hub(user="github-actions[bot]")
+        issue = hub.tracker.get_issue(n)
+        raw = {"number": n, "id": issue["id"], "title": issue["title"], "body": issue["body"], "state": issue["state"],
+               "state_reason": issue.get("state_reason"), "labels": [{"name": x} for x in issue["labels"]],
+               "assignees": [], "user": {"login": issue["user"]}, "author_association": issue.get("association")}
         ev = {"action": action, "issue": raw, "sender": {"login": sender}}
         if label:
             ev["label"] = {"name": label}
@@ -508,82 +513,148 @@ class Guard(World):
             ev["changes"] = changes
         return S.guard_event(hub, ev)
 
-    def test_guard_has_no_blind_spots_for_bots_or_label_tricks(self):
-        self.sb("propose", "Docs", "Proposal", agent="claude-code")
-        hub = self.hub()
-        hub.tracker.add_labels(1, ["sb:todo"])
-        self.assertIn("undid approve by @some-app[bot]", self.event("labeled", 1, "some-app[bot]", "sb:todo"))
-        self.assertEqual(self.state("SB-1"), "proposed")
-        # An issue made approved from the start, with no proposal label to replace.
-        hub.tracker.create_issue("Straight to todo", "", ["signalbox"])
-        hub.tracker.add_labels(2, ["sb:todo"])
-        self.assertIn("undid approve", self.event("labeled", 2, "acme-bot", "sb:todo"))
-        self.assertEqual(self.state("SB-2"), "proposed")
-        # Rejecting approved work is a decision; withdrawing a proposal is not.
-        self.sb("approve", "SB-2", tty=True)
-        hub.tracker.update_issue(2, state="closed", state_reason="not_planned")
-        self.assertIn("undid reject by @carol", self.event("closed", 2, "carol", reason="not_planned"))
-        self.assertEqual(self.state("SB-2"), "todo")
-        self.sb("propose", "Docs", "Mine to withdraw", agent="claude-code")
-        hub.tracker.update_issue(3, state="closed", state_reason="not_planned")
-        self.assertIsNone(self.event("closed", 3, "acme-bot", reason="not_planned"))
-        # A pause by the holder adds todo while doing is still there: not a decision.
-        self.sb("claim", "SB-2", "--no-worktree", agent="claude-code")
-        self.assertIsNone(self.event("labeled", 2, "acme-bot", "sb:todo"))
-        self.assertIn("undid turn YOLO on", self.event("labeled", 2, "acme-bot", "sb:yolo"))
+    def labels(self, n):
+        return sorted(self.as_("alice").get_issue(n)["labels"])
 
-    def test_guard_sees_tasks_taken_off_the_board_or_demoted(self):
-        self.sb("propose", "Docs", "Approved work", agent="claude-code")
-        self.sb("approve", "SB-1", tty=True)
-        hub = self.hub()
-        # Taking the signalbox label off, to change the task unguarded and put it back.
-        hub.tracker.remove_label(1, "signalbox")
-        self.assertIn("undid take approved work off the board by @acme-bot", self.event("unlabeled", 1, "acme-bot", "signalbox"))
-        self.assertIn("signalbox", hub.tracker.get_issue(1)["labels"])
-        # Putting an issue on the board already approved.
-        hub.tracker.create_issue("Sneaky", "", ["sb:todo", "sb:yolo"])
-        hub.tracker.add_labels(2, ["signalbox"])
-        self.assertIn("undid put approved work on the board", self.event("labeled", 2, "carol", "signalbox"))
-        self.assertEqual(sorted(hub.tracker.get_issue(2)["labels"]), ["sb:proposed", "signalbox"])
-        # Demoting approved work to a proposal by taking its state label off: put back.
-        hub.tracker.remove_label(1, "sb:todo")
-        self.assertIn("undid move approved work back to proposed", self.event("unlabeled", 1, "acme-bot", "sb:todo"))
+    def approved(self, title="Approved work"):
+        self.sb("propose", "Docs", title, agent="claude-code")
+        n = len(self.as_("alice").list_issues())
+        self.sb("approve", f"SB-{n}", tty=True)
+        return n
+
+    def test_approvals_by_agent_accounts_bots_and_non_approvers_are_undone(self):
+        self.sb("propose", "Docs", "Proposal", agent="claude-code")
+        for who in ("acme-bot", "some-app[bot]", "carol"):
+            self.as_(who).add_labels(1, ["sb:todo"])
+            self.assertIn(f"undid approve by @{who}", self.guard(1))
+            self.assertEqual(self.state("SB-1"), "proposed")
+        self.as_("alice").add_labels(1, ["sb:todo"])
+        self.assertIsNone(self.guard(1))
         self.assertEqual(self.state("SB-1"), "todo")
-        # A pause takes doing off after adding todo, and a close takes labels off a closed issue: no decisions.
-        self.sb("claim", "SB-1", "--no-worktree", agent="claude-code")
-        self.sb("pause", "SB-1", agent="claude-code")
-        self.assertIsNone(self.event("unlabeled", 1, "acme-bot", "sb:doing"))
-        self.assertIsNone(self.event("unlabeled", 2, "alice", "signalbox"))
+
+    def test_no_order_of_changes_turns_an_approval_into_a_pause(self):
+        self.sb("propose", "Docs", "Proposal", agent="claude-code")
+        bot = self.as_("acme-bot")
+        bot.add_labels(1, ["sb:doing"])
+        self.guard(1)  # a run between the two changes...
+        bot.add_labels(1, ["sb:todo"])
+        self.assertIn("undid approve by @acme-bot", self.guard(1))  # ...and after: todo next to doing is no pause here
+        self.assertEqual(self.labels(1), ["lane:Docs", "sb:proposed", "signalbox"])
+        # The same with no run in between, and a send-back done by way of doing.
+        n = self.approved()
+        self.sb("claim", f"SB-{n}", "--no-worktree", agent="claude-code")
+        self.sb("finish", f"SB-{n}", "-m", "Done", agent="claude-code")
+        bot.add_labels(n, ["sb:doing"])
+        bot.remove_label(n, "sb:review")
+        bot.add_labels(n, ["sb:todo"])
+        bot.remove_label(n, "sb:doing")
+        self.assertIn("undid", self.guard(n))
+        self.assertEqual(self.state(f"SB-{n}"), "review")
+
+    def test_agents_cannot_claim_what_is_still_marked_proposed(self):
+        self.sb("propose", "Docs", "Proposal", agent="claude-code")
+        self.as_("acme-bot").add_labels(1, ["sb:todo"])  # before any guard run
+        self.assertIn("still marked proposed", self.sb("claim", "SB-1", "--no-worktree", agent="claude-code", code=1))
+
+    def test_a_run_that_github_cancels_loses_nothing(self):
+        n = self.approved()
+        self.as_("acme-bot").add_labels(n, ["sb:yolo"])  # its run is cancelled by the next one...
+        self.as_("carol").add_labels(n, ["sb:proposed"])  # ...which judges both
+        self.assertIn("undid turn YOLO on by @acme-bot", self.guard(n, label="sb:proposed"))
+        self.assertNotIn("sb:yolo", self.labels(n))
+
+    def test_rejections_reopenings_and_withdrawals(self):
+        n = self.approved()
+        self.as_("carol").update_issue(n, state="closed", state_reason="not_planned")
+        self.assertIn("undid reject by @carol", self.guard(n, "closed"))
+        self.assertEqual(self.state(f"SB-{n}"), "todo")
+        self.as_("alice").update_issue(n, state="closed", state_reason="not_planned")  # rejected on github.com: labels stay
+        self.assertIsNone(self.guard(n, "closed"))
+        self.as_("acme-bot").update_issue(n, state="open")
+        self.assertIn("undid reopen closed work by @acme-bot", self.guard(n, "reopened"))
+        self.assertEqual(self.as_("alice").get_issue(n)["state"], "closed")
+        self.sb("propose", "Docs", "Mine to withdraw", agent="claude-code", user="acme-bot")
+        m = len(self.as_("alice").list_issues())
+        self.sb("withdraw", f"SB-{m}", agent="claude-code", user="acme-bot")
+        self.assertIsNone(self.guard(m, "closed"))
+
+    def test_an_agent_accounts_ordinary_work_is_left_alone(self):
+        self.sb("propose", "Docs", "Base", agent="claude-code")
+        self.sb("propose", "Docs", "Target", "--deps", "SB-1", agent="claude-code")
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        bot = dict(user="acme-bot", agent="claude-code")
+        self.sb("claim", "SB-1", "--no-worktree", **bot)
+        self.sb("pause", "SB-1", **bot)
+        self.sb("claim", "SB-1", "--no-worktree", **bot)
+        self.sb("note", "SB-1", "Halfway", **bot)
+        self.sb("yolo", "SB-2", "on", tty=True)
+        self.assertIn("doing -> done", self.sb("finish", "SB-1", "-m", "Done", **bot))
+        self.assertIsNone(self.guard(1, "closed"))
+        self.assertEqual(self.state("SB-1"), "done")
+        self.sb("claim", "SB-2", "--no-worktree", **bot)
+        self.sb("finish", "SB-2", "-m", "Done", **bot)
+        self.assertIsNone(self.guard(2, label="sb:review"))
+        self.assertEqual(self.state("SB-2"), "review")
+
+    def test_kinds_and_yolo_stops_of_approved_work(self):
+        n = self.approved()
+        self.as_("acme-bot").add_labels(n, ["kind:research"])  # would skip the checks
+        self.assertIn("undid change the kind of approved work", self.guard(n))
+        self.assertNotIn("kind:research", self.labels(n))
+        self.sb("yolo", f"SB-{n}", "stop", tty=True)
+        self.as_("acme-bot").remove_label(n, "sb:yolo-stop")
+        self.assertIn("undid remove a YOLO stop", self.guard(n, "unlabeled", "sb:yolo-stop"))
+        self.assertIn("sb:yolo-stop", self.labels(n))
+
+    def test_tasks_taken_off_the_board_or_demoted(self):
+        n = self.approved()
+        bot = self.as_("acme-bot")
+        bot.remove_label(n, "signalbox")
+        self.assertIn("undid take approved work off the board", self.guard(n, "unlabeled", "signalbox"))
+        self.assertIn("signalbox", self.labels(n))
+        bot.add_labels(n, ["sb:proposed"])
+        bot.remove_label(n, "sb:todo")  # a demotion by way of the proposal label
+        self.assertIn("undid move approved work back to proposed", self.guard(n, "unlabeled", "sb:todo"))
+        self.assertEqual(self.state(f"SB-{n}"), "todo")
+
+    def _age_events(self, n):
+        data = json.loads(read(self.hub_path))
+        for e in data["events"][str(n)]:
+            e["created_at"] = "2020-01-01T00:00:00Z"
+        with open(self.hub_path, "w") as f:
+            json.dump(data, f)
+
+    def test_history_is_judged_once_and_returning_tasks_in_full(self):
+        n = self.approved()
+        # Long ago, alice approved; today she is no longer an approver. Her past approval stands.
+        self._age_events(n)
+        self.as_("carol").add_labels(n, ["kind:task"])
+        with mock.patch.object(S.Hub, "approvers_for_lane", lambda hub, lane: {"bob"}):
+            out = self.guard(n)
+        self.assertIn("change the kind", out)
+        self.assertNotIn("undid approve", out)
+        self.assertEqual(self.state(f"SB-{n}"), "todo")
+        # An issue off the board was approved long ago by an agent account; put on the board now, all of it counts.
+        t = self.as_("acme-bot").create_issue("Off the board", "", ["sb:todo"])
+        self._age_events(t["number"])
+        self.as_("alice").add_labels(t["number"], ["signalbox"])
+        self.assertIn("undid approve by @acme-bot", self.guard(t["number"], label="signalbox"))
+        self.assertEqual(self.labels(t["number"]), ["signalbox"])
 
     def test_guard_restores_approved_tasks_that_agent_accounts_rewrite(self):
         self.sb("propose", "Docs", "Write the guide", "Cover install and upgrade", agent="claude-code")
         self.sb("propose", "Docs", "Other", agent="claude-code")
         self.sb("approve", "SB-1", "SB-2", tty=True)
         self.sb("depend", "SB-1", "SB-2", tty=True)
-        hub = self.hub()
-        before = hub.tracker.get_issue(1)
-        hub.tracker.update_issue(1, title="Do nothing", body=S.join_body("Skip it", {"by": "claude-code"}))
-        out = self.event("edited", 1, "acme-bot", changes={"title": {"from": before["title"]}, "body": {"from": before["body"]}})
+        before = self.as_("alice").get_issue(1)
+        self.as_("acme-bot").update_issue(1, title="Do nothing", body=S.join_body("Skip it", {"by": "claude-code"}))
+        out = self.guard(1, "edited", sender="acme-bot", changes={"title": {"from": before["title"]}, "body": {"from": before["body"]}})
         self.assertIn("undid change an approved task", out)
-        after = hub.tracker.get_issue(1)
+        after = self.as_("alice").get_issue(1)
         self.assertEqual(after["title"], "Write the guide")
         desc, meta = S.split_body(after["body"])
         self.assertEqual((desc, meta["deps"]), ("Cover install and upgrade", [2]))
-        self.assertIsNone(self.event("edited", 1, "alice", changes={"title": {"from": "x"}}))
-
-    def test_guard_undoes_decisions_by_agents_and_non_approvers(self):
-        self.sb("propose", "Docs", "Proposal", agent="claude-code")
-        hub = self.hub()
-        hub.tracker.add_labels(1, ["sb:todo"])  # the bot approved it on GitHub directly
-        self.assertIn("undid approve by @acme-bot", self.event("labeled", 1, "acme-bot", "sb:todo"))
-        self.assertEqual(self.state("SB-1"), "proposed")
-        self.assertIsNone(self.event("labeled", 1, "alice", "sb:todo"))
-        self.sb("approve", "SB-1", tty=True)
-        self.sb("claim", "SB-1", "--no-worktree", agent="claude-code")
-        self.sb("finish", "SB-1", "-m", "done", agent="claude-code")
-        hub.tracker.update_issue(1, state="closed", state_reason="completed")
-        self.assertIn("undid mark done by @carol", self.event("closed", 1, "carol", reason="completed"))
-        self.assertEqual(self.state("SB-1"), "review")
+        self.assertIsNone(self.guard(1, "edited", sender="alice", changes={"title": {"from": "x"}}))
 
 
 class Security(World):
@@ -975,15 +1046,14 @@ class KanvasFiveFeatures(World):
         with self.assertRaisesRegex(S.SignalboxError, "cannot change where YOLO stops"):
             hub.apply_board(K.parse_board(K.dumps(old)), K.parse_board(K.dumps(new)))
         self.sb("yolo", "SB-2", "stop", tty=True)
-        hub = self.hub()
+        self.hub(user="acme-bot").tracker.remove_label(2, S.YOLO_STOP_LABEL)
+        hub = self.hub(user="github-actions[bot]")
         issue = hub.tracker.get_issue(2)
-        hub.tracker.remove_label(2, S.YOLO_STOP_LABEL)
         raw = {"number": 2, "id": issue["id"], "title": issue["title"], "body": issue["body"], "state": "open",
-               "labels": [{"name": x} for x in issue["labels"] if x != S.YOLO_STOP_LABEL], "assignees": [], "user": {"login": "alice"}}
+               "labels": [{"name": x} for x in issue["labels"]], "assignees": [], "user": {"login": "alice"}}
         out = S.guard_event(hub, {"action": "unlabeled", "issue": raw, "label": {"name": S.YOLO_STOP_LABEL}, "sender": {"login": "acme-bot"}})
         self.assertIn("undid remove a YOLO stop", out)
         self.assertIn(S.YOLO_STOP_LABEL, hub.tracker.get_issue(2)["labels"])
-
 
 class ReReview(World):
     """Holes found by the second review, after the Kanvas 0.5.0 merge."""
@@ -1027,45 +1097,44 @@ class ReReview(World):
             S.write_file(os.path.join(self.tmp, "linkdir", "x"), "x")
         self.assertEqual(os.listdir(outside), [])
 
-    def guard(self, action, number, sender, label=None, reason=None):
-        hub = self.hub()
-        issue = hub.tracker.get_issue(number)
-        raw = {"number": number, "id": issue["id"], "title": issue["title"], "body": issue["body"], "state": issue["state"],
-               "state_reason": reason, "labels": [{"name": x} for x in issue["labels"]], "assignees": [],
-               "user": {"login": issue["user"]}, "author_association": issue.get("association")}
-        ev = {"action": action, "issue": raw, "sender": {"login": sender}}
-        if label:
-            ev["label"] = {"name": label}
-        return S.guard_event(hub, ev)
+    def guard(self, n, action="labeled", label=None):
+        hub = self.hub(user="github-actions[bot]")
+        issue = hub.tracker.get_issue(n)
+        raw = {"number": n, "id": issue["id"], "title": issue["title"], "body": issue["body"], "state": issue["state"],
+               "labels": [{"name": x} for x in issue["labels"]], "assignees": [], "user": {"login": issue["user"]},
+               "author_association": issue.get("association")}
+        return S.guard_event(hub, {"action": action, "issue": raw, "label": {"name": label} if label else None,
+                                   "sender": {"login": "someone"}})
 
     def test_doing_on_a_proposal_is_an_approval(self):
         self.sb("propose", "Docs", "Unapproved", agent="claude-code")
-        hub = self.hub()
-        hub.tracker.add_labels(1, ["sb:doing"])
-        hub.tracker.remove_label(1, "sb:proposed")
+        bot = self.hub(user="acme-bot").tracker
+        bot.add_labels(1, ["sb:doing"])
+        bot.remove_label(1, "sb:proposed")
         self.assertIn("is in doing with no interlock", self.sb("claim", "SB-1", "--no-worktree", agent="claude-code", code=1))
-        hub.tracker.add_labels(1, ["sb:proposed"])
-        self.assertIn("undid start a proposal by @acme-bot", self.guard("labeled", 1, "acme-bot", "sb:doing"))
+        self.assertIn("undid start work no one approved by @acme-bot", self.guard(1))
         self.assertEqual(self.state("SB-1"), "proposed")
 
     def test_approved_work_leaves_a_lane_only_with_its_approvers(self):
         self.plan()
-        hub = self.hub()
-        hub.tracker.remove_label(1, "lane:Platform")  # bob moves alice's approved task to Docs, where anyone decides
-        self.assertIn("undid move approved work out of lane Platform by @bob", self.guard("unlabeled", 1, "bob", "lane:Platform"))
-        self.assertIn("lane:Platform", hub.tracker.get_issue(1)["labels"])
-        hub.tracker.add_labels(3, ["lane:Platform"])  # into alice's lane: also hers to decide
-        self.assertIn("undid move approved work into lane Platform", self.guard("labeled", 3, "bob", "lane:Platform"))
-        self.assertIsNone(self.guard("unlabeled", 1, "alice", "lane:Platform"))
+        bob = self.hub(user="bob").tracker
+        bob.remove_label(1, "lane:Platform")  # bob moves alice's approved task to Docs, where anyone decides
+        self.assertIn("undid move approved work out of lane Platform by @bob", self.guard(1, "unlabeled", "lane:Platform"))
+        self.assertIn("lane:Platform", bob.get_issue(1)["labels"])
+        bob.add_labels(3, ["lane:Platform"])  # into alice's lane: also hers to decide
+        self.assertIn("undid move approved work into lane Platform", self.guard(3, label="lane:Platform"))
+        self.hub(user="alice").tracker.remove_label(1, "lane:Platform")
+        self.assertIsNone(self.guard(1, "unlabeled", "lane:Platform"))
 
     def test_people_outside_the_team_cannot_decide_by_closing_their_own_issue(self):
-        data = {"next": 2, "comments": {}, "labels": {}, "issues": {"1": {
-            "number": 1, "id": 901, "title": "From a stranger", "body": "", "labels": ["signalbox", "sb:todo"],
-            "state": "closed", "state_reason": "completed", "assignees": [], "user": "stranger", "association": "NONE",
-            "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z", "url": "x"}}}
+        issue = self.hub(user="stranger").tracker.create_issue("From a stranger", "", ["signalbox"])
+        self.sb("approve", "SB-1", tty=True)
+        data = json.loads(read(self.hub_path))
+        data["issues"]["1"]["association"] = "NONE"
         with open(self.hub_path, "w") as f:
             json.dump(data, f)
-        self.assertIn("undid mark done by @stranger", self.guard("closed", 1, "stranger", reason="completed"))
+        self.hub(user="stranger").tracker.update_issue(issue["number"], state="closed", state_reason="completed")
+        self.assertIn("undid mark done by @stranger", self.guard(1, "closed"))
         self.assertIn("who is outside the team", self.hub().tracker.list_comments(1)[-1]["body"])
         self.assertEqual(self.hub().tracker.get_issue(1)["state"], "open")
 
