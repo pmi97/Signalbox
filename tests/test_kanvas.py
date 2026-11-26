@@ -2056,9 +2056,11 @@ class InstalledCommandTests(TempBoard):
     def test_the_kanvas_of_a_uvx_run_does_not_count(self):
         """uvx puts its temporary environment on PATH and sets UV; that `kanvas` is gone afterwards."""
         temporary = os.path.join(sys.prefix, "Scripts" if os.name == "nt" else "bin", "kanvas")
+        # an install outside this interpreter's environment (not /usr/local/bin: Python itself may live there)
+        elsewhere = os.path.join(os.path.dirname(os.path.abspath(sys.prefix)), "kanvas-elsewhere", "bin", "kanvas")
         for found, uv, expected in ((temporary, "/usr/bin/uv", "uvx kanvas-board init"),
                                     (temporary, None, "kanvas init"),
-                                    ("/usr/local/bin/kanvas", "/usr/bin/uv", "kanvas init")):
+                                    (elsewhere, "/usr/bin/uv", "kanvas init")):
             with self.subTest(found=found, uv=uv), mock.patch.object(kanvas, "INSTALLED", True), \
                     mock.patch("shutil.which", return_value=found), \
                     mock.patch.dict(os.environ, {"UV": uv} if uv else {}, clear=False):

@@ -1533,6 +1533,22 @@ class GuardVerifySixth(World):
         self.assertEqual(self.state("SB-1"), "doing")
         self.assertIn("doing -> done", self.sb("finish", "SB-1", "-m", "Done", **self.bot))
 
+    def test_under_yolo_a_person_finishes_what_the_cli_lets_them(self):
+        """YOLO delegates finishing, not deciding: a person on the team who closes an agent's task in a chain gets
+        what `claim --take-over` and `finish` give them in the CLI; no account outside the team gets it."""
+        for n in (1, 2):
+            self.sb("propose", "Docs", f"Work {n}", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("propose", "Docs", "Release", "--deps", "SB-1", "SB-2", tty=True)
+        self.sb("yolo", "SB-3", "on", tty=True)
+        self.sb("claim", "SB-1", "--no-worktree", **self.bot)
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        self.sb("claim", "SB-1", "--take-over", "--no-worktree", user="carol", tty=True)
+        self.assertIn("doing -> done", self.sb("finish", "SB-1", "-m", "Done", user="carol", tty=True))
+        self.as_("carol").update_issue(2, state="closed", state_reason="completed")
+        self.assertIn("marked #2 done under YOLO", self.guard(2, "closed", sender="carol"))
+        self.assertEqual((self.state("SB-1"), self.state("SB-2")), ("done", "done"))
+
     def test_one_sweep_puts_a_chain_right_whatever_it_judges_first(self):
         self.sb("propose", "Docs", "A member", **self.bot)
         self.sb("propose", "Docs", "X work", **self.bot)
