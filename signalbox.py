@@ -182,6 +182,9 @@ def safe_json(text, limit=65536):
         return None
 
 
+MAX_DEPS = 200  # more is no plan anyone reads, and only costs whoever walks the graph
+
+
 def clean_meta(meta):
     """The meta block with every known field of the type readers expect; anyone can write an issue body."""
     if not isinstance(meta, dict):
@@ -190,7 +193,7 @@ def clean_meta(meta):
     ints = lambda v: [x for x in v if isinstance(x, int) and not isinstance(x, bool)] if isinstance(v, list) else []
     strs = lambda v: [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
     if "deps" in out:
-        out["deps"] = ints(out["deps"])
+        out["deps"] = list(dict.fromkeys(ints(out["deps"])))[:MAX_DEPS]  # once each, in order
     if "paths" in out:
         out["paths"] = strs(out["paths"])
     if "map" in out and not (isinstance(out["map"], int) and not isinstance(out["map"], bool)):
@@ -1460,10 +1463,11 @@ def sections(text):
     """[(heading or None, content)] of Markdown split at `## ` headings."""
     out, head, buf = [], None, []
     for line in (text or "").split("\n"):
-        m = re.match(r"^##\s+(.+?)\s*$", line)
-        if m:
+        # "## Name": checked by hand, not by a pattern that backtracks on a long line of spaces
+        name = line[2:].strip() if line.startswith("##") and len(line) > 2 and line[2] in " \t" else ""
+        if name:
             out.append((head, "\n".join(buf).strip()))
-            head, buf = m.group(1), []
+            head, buf = name, []
         else:
             buf.append(line)
     out.append((head, "\n".join(buf).strip()))
@@ -2012,15 +2016,13 @@ class Hub:
 
     def yolo_reaches(self, via, issue):
         """Whether whoever gave the YOLO task `via` its YOLO (or stop) may decide in `issue`'s lane."""
-        grant = None
-        for e in self.tracker.list_events(number_of(via)):
-            if e.get("event") == "labeled" and e.get("label") in (YOLO_LABEL, YOLO_STOP_LABEL) and \
-                    login_of(e.get("actor")) not in TRUSTED_BOTS:
-                grant = login_of(e.get("actor"))
-        if not grant:
+        head = self.tracker.get_issue(number_of(via))
+        events = self.tracker.list_events(head["number"])
+        if not events:
             return True  # no history to tell (an old hub): as before
-        allowed = self.approvers_for_lane(self.lane_of(issue))
-        return not allowed or grant in allowed
+        legit, _ = guard_replay(self, head, events, depth=1)
+        grant = legit["grants"].get(YOLO_LABEL) or legit["grants"].get(YOLO_STOP_LABEL)
+        return bool(grant) and yolo_grant_reaches(self, grant, self.lane_of(issue), issue)
 
     def in_yolo_chain(self, issue):
         board = self.board(with_notes=False, locks=False)
@@ -4044,6 +4046,8 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
             violations.append((birth[-1], "create approved work", lane_in(labels, rules)))
             labels -= granted
         legit["labels"] |= labels
+        for label in labels & {YOLO_LABEL, YOLO_STOP_LABEL}:
+            legit["grants"][label] = (author, created)
 
     for e in rest:
         kind, actor, label = e.get("event"), login_of(e.get("actor")), e.get("label")
@@ -4131,6 +4135,17 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None):
     return legit, violations
 
 
+def yolo_grant_reaches(hub, grant, lane, issue):
+    """Whether a YOLO given by `grant` (actor, when) reaches work in `lane`: its giver decides there, by the rules of
+    the day they gave it. The CLI and the guard both judge it so."""
+    actor, granted = grant
+    rules = hub.at(granted)
+    try:
+        return guard_permitted(rules, actor, lane, issue, past=rules is not hub)
+    except GuardBlind:
+        return False
+
+
 def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None):
     """Whether YOLO covered task `n` at a moment (just before a close, or a version of a body): a YOLO task, or a
     stop, that waits on it carried its label legitimately then, had not gone to review, and was given YOLO by
@@ -4160,11 +4175,23 @@ def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None):
             return {hub.tid(m).upper(): {"id": hub.tid(m), "title": "", "state": "todo", "deps": [hub.tid(d) for d in ds]}
                     for m, ds in deps.items()}
         idx = index()
+        # What waits on this task, found once by walking the links backwards; the path to a head is what waits on
+        # this task and that the head waits on.
+        waiting, stack = set(), [me]
+        back = {}
+        for k, t in idx.items():
+            for d in t["deps"]:
+                back.setdefault(d.upper(), []).append(k)
+        while stack:
+            for k in back.get(stack.pop(), []):
+                if k not in waiting:
+                    waiting.add(k)
+                    stack.append(k)
         on_path = set()
         for h in heads:
-            t = idx[hub.tid(h).upper()]
-            if me in K._upstream(idx, t):
-                on_path |= {x for x in K._upstream(idx, t) if me in K._upstream(idx, idx[x])} | {t["id"].upper()}
+            key = hub.tid(h).upper()
+            if key in waiting:
+                on_path |= (K._upstream(idx, idx[key]) & waiting) | {key}
         for m in [m for m in deps if hub.tid(m).upper() in on_path]:
             got = legit_deps(hub, issues[m]) if not depth else deps_at(hub, issues[m], when, event_id)
             deps[m] = [d for d in got if d in issues]
@@ -4180,12 +4207,8 @@ def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None):
         if via and via.upper() != me:
             head = number_of(via)
             grant = heads[head][0]["grants"].get(YOLO_LABEL) or heads[head][0]["grants"].get(YOLO_STOP_LABEL)
-            if grant:
-                actor, granted = grant
-                rules = hub.at(granted)
-                covered = guard_permitted(rules, actor, lane, issues.get(n) or {"user": ""}, past=rules is not hub)
-            else:
-                covered = True
+            # Whoever gave the YOLO must decide in this task's lane; a YOLO no one is known to have given covers nothing.
+            covered = bool(grant) and yolo_grant_reaches(hub, grant, lane, issues.get(n) or {"user": ""})
     memo[key] = covered
     return covered
 
@@ -4215,15 +4238,21 @@ def body_walk(hub, issue, events, steps, depth=0):
             yolo_covered_at(hub, issue["number"], cut.get("until") or t, event_id=cut.get("before"), depth=1, lane=None)
 
     undone = []
-    lane = hub.lane_of(issue)
+    lanes = {x["label"]: x for x in hub.lanes()}
     good_desc, good_meta = split_body(steps[0][0])
     for body, editor, t, seq in [tuple(x) + (None,) * (4 - len(x)) for x in steps[1:]]:
+        if editor in TRUSTED_BOTS:
+            continue  # the guard's own writes put back a good version; they never make a new one
         r_desc, r_meta = split_body(body)
         rules = hub.at(t)
-        approved = approved_at(t, seq) if t or seq is not None else True
-        restricted = editor not in TRUSTED_BOTS and guard_restricted(rules, editor, issue)
+        state_then = guard_replay(hub, issue, events, depth=1, **then(t, seq))[0] if (t or seq is not None) else None
+        approved = legit_approved(state_then) if state_then else True
+        kind_then = next((x[len(KIND_PREFIX):] for x in (state_then or {"labels": set(issue["labels"])})["labels"]
+                          if x.startswith(KIND_PREFIX)), "build")
+        lane = next((lanes[x] for x in (state_then or {"labels": set(issue["labels"])})["labels"] if x in lanes), None)
+        restricted = guard_restricted(rules, editor, issue)
         if approved and restricted:
-            if r_desc != good_desc and hub.kind_of(issue) == "map":
+            if r_desc != good_desc and kind_then == "map":
                 # agents chart fog and scope; the destination and notes are the people's
                 for name in ("Destination", "Notes"):
                     if section(r_desc, name) != section(good_desc, name):
@@ -4244,7 +4273,7 @@ def body_walk(hub, issue, events, steps, depth=0):
             else:
                 old -= old - new
         if new - old:
-            if editor not in TRUSTED_BOTS and not guard_permitted(rules, editor, lane, issue, past=rules is not hub) and chain_at(t, seq):
+            if not guard_permitted(rules, editor, lane, issue, past=rules is not hub) and chain_at(t, seq):
                 undone.append(f"link work into a YOLO chain by @{editor}")
             else:
                 old |= new - old
