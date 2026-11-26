@@ -2526,7 +2526,7 @@ class Hub:
         self._close_unplanned(issue, f"Out of scope: {why}")
         m = self.issue(parent)
         desc, _ = split_body(m["body"])
-        line = f"- [{issue['title']}]({issue.get('url') or '#' + str(issue['number'])}): {why.strip()}"
+        line = scope_line(issue, why)  # the guard lets an agent add this line, and only this
         self.update_meta(m, lambda _m: None, desc=set_section(desc, "Out of scope", (section(desc, "Out of scope") + "\n" + line).strip()))
 
     def frontier(self, map_ref=None):
@@ -4092,10 +4092,12 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
             legit["grants"][label] = (author, created)
 
     snap()
+    left = None  # (lane, actor): the lane the last change took off, while the next change may put another on
     for e in rest:
         kind, actor, label = e.get("event"), login_of(e.get("actor")), e.get("label")
         if kind in ("labeled", "unlabeled") and not guard_managed(label) or kind not in ("labeled", "unlabeled", "closed", "reopened"):
             continue
+        just_left, left = left, None
         t = parse_iso(e.get("created_at"))
         if until and t and t > until or before is not None and isinstance(e.get("id"), int) and e["id"] >= before:
             break
@@ -4120,8 +4122,11 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
                     decision = "make YOLO stop before it"  # YOLO then covers what it waits on
                 elif label.startswith(LANE_PREFIX) and cur != "proposed" and is_open:
                     decision = f"move approved work into lane {label[len(LANE_PREFIX):]}"
-                    if lane and label not in labels and lane["label"] != label:
-                        also = lane  # next to the lane it is in: that lane's approvers decide too
+                    if label not in labels and (lane is None or lane["label"] != label):
+                        # Those who decide where it is decide too: beside another lane, that lane's approvers; in no
+                        # lane, the approvers of work in no lane, unless the same account just took it off a lane
+                        # (a move, which adds the new lane after taking the old off), where that lane's do.
+                        also = (lane,) if lane else (just_left[0] if just_left and just_left[1] == actor else None,)
                     lane = lane_named(label, rules)
                 elif label.startswith(KIND_PREFIX) and cur != "proposed" and is_open:
                     decision = "change the kind of approved work"
@@ -4164,8 +4169,8 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
                     (legit["reason"] == "completed" or legit["closed_from"] not in (None, "proposed")):
                 decision = "reopen closed work"  # done, or rejected after it was approved
         if decision and also and guard_permitted(rules, actor, lane, issue, past) and \
-                not guard_permitted(rules, actor, also, issue, past):
-            lane = also
+                not guard_permitted(rules, actor, also[0], issue, past):
+            lane = also[0]
         if decision and not guard_permitted(rules, actor, lane, issue, past):
             violations.append((e, decision, lane))
             snap(e)
@@ -4175,6 +4180,8 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
             if label in (YOLO_LABEL, YOLO_STOP_LABEL) and actor not in TRUSTED_BOTS:
                 legit["grants"][label] = (actor, t)
         elif kind == "unlabeled":
+            if label.startswith(LANE_PREFIX) and label in labels:
+                left = (lane_named(label, rules), actor)
             labels.discard(label)
             legit["grants"].pop(label, None) if actor not in TRUSTED_BOTS else None
         elif kind == "closed":
@@ -4347,25 +4354,54 @@ def decision_lines(hub, map_n):
     return out
 
 
+def scope_lines(hub, map_n):
+    """The Out of scope lines an agent account may add to map `map_n`: one for each ticket of the map closed as not
+    planned by its legitimate history, with the reason its out-of-scope note gives."""
+    memo = hub.__dict__.setdefault("_guard_memo", {})
+    key = ("scope", map_n)
+    if key in memo:
+        return memo[key]
+    out = set()
+    for ticket in guard_issues(hub):
+        if split_body(ticket["body"])[1].get("map") != map_n or ticket["number"] == map_n:
+            continue
+        events = guard_events(hub, ticket["number"])
+        legit, _ = guard_replay(hub, ticket, events)
+        if legit["open"] or legit["reason"] == "completed":
+            continue
+        whys = [note["text"][len("Out of scope:"):].strip() for note in
+                (parse_note(c, hub.team) for c in hub.tracker.list_comments(ticket["number"]))
+                if note.get("kind") == "event" and not note.get("external") and note["text"].startswith("Out of scope:")]
+        titles = {ticket["title"]} | {e["rename"].get(x) for e in events if isinstance(e.get("rename"), dict)
+                                      for x in ("from", "to")}
+        out |= {scope_line(dict(ticket, title=title), why) for title in titles if title for why in whys}
+    memo[key] = out
+    return out
+
+
+def scope_line(ticket, why):
+    """The line a ticket ruled out of scope adds to its map's Out of scope."""
+    return f"- [{ticket['title']}]({ticket.get('url') or '#' + str(ticket['number'])}): {why.strip()}"
+
+
 def lines_of(text):
     return [line.rstrip() for line in (text or "").split("\n") if line.strip()]
 
 
 def map_by_agent(hub, issue, good, new):
-    """An agent account's version of an approved map, kept where agents may write: its fog (Not yet specified) and
-    scope (Out of scope), and lines added to Decisions so far for decision tickets of the map that are done. The rest
-    is the people's. Returns (description, what was refused)."""
-    keep = good
-    for name in MAP_AGENT_SECTIONS:
-        keep = set_section(keep, name, section(new, name))
+    """An agent account's version of an approved map, kept where agents may write: its fog (Not yet specified), and
+    lines added to Decisions so far and Out of scope for tickets of the map that are done or ruled out. The rest,
+    those sections' earlier lines included, is the people's. Returns (description, what was refused)."""
+    keep = set_section(good, "Not yet specified", section(new, "Not yet specified"))
     refused = []
-    old_d, new_d = lines_of(section(good, "Decisions so far")), lines_of(section(new, "Decisions so far"))
-    if old_d != new_d:
-        added = new_d[len(old_d):]
-        if new_d[:len(old_d)] == old_d and all(x in decision_lines(hub, issue["number"]) for x in added):
-            keep = set_section(keep, "Decisions so far", section(new, "Decisions so far"))
+    for name, what, allowed in (("Decisions so far", "decisions", decision_lines), ("Out of scope", "scope", scope_lines)):
+        old_l, new_l = lines_of(section(good, name)), lines_of(section(new, name))
+        if old_l == new_l:
+            continue
+        if new_l[:len(old_l)] == old_l and all(x in allowed(hub, issue["number"]) for x in new_l[len(old_l):]):
+            keep = set_section(keep, name, section(new, name))
         else:
-            refused.append("decisions")
+            refused.append(what)
 
     def people_part(text):
         return [(h.lower() if h else None, c) for h, c in sections(text)
@@ -4418,7 +4454,8 @@ def body_walk(hub, issue, events, steps, depth=0):
                     # the agent's part beside the people's would be too long for GitHub to take: the last good
                     # version stays whole (an agent's own version, nothing refused, is as long as it wrote it)
                     kept, refused = good_desc, refused + ["long"]
-                words = {"decisions": "rewrite a map's decisions", "text": "rewrite a map's text outside its fog and scope",
+                words = {"decisions": "rewrite a map's decisions", "scope": "rewrite a map's scope",
+                         "text": "rewrite a map's text outside its fog and scope",
                          "long": "make a map too long to keep the people's text in it"}
                 undone += [f"{words[x]} by @{editor}" for x in dict.fromkeys(refused)]
                 good_desc = kept

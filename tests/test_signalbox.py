@@ -1332,7 +1332,8 @@ class GuardVerifySixth(World):
 
     config = {"approvers": ["alice"], "agents": {"logins": ["acme-bot"]},
               "lanes": [{"name": "Platform", "prefix": "PL", "owners": ["alice"]}, {"name": "Docs", "prefix": "DC"},
-                        {"name": "Ops", "prefix": "OP", "owners": ["dave"]}]}
+                        {"name": "Ops", "prefix": "OP", "owners": ["dave"]},
+                        {"name": "Infra", "prefix": "IN", "owners": ["dave"]}]}
     as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
     bot = dict(user="acme-bot", agent="claude-code")
     gh, edit_deps = GuardVerifyFifth.gh, GuardVerifyFifth.edit_deps
@@ -1380,6 +1381,45 @@ class GuardVerifySixth(World):
         self.assertIsNone(self.guard(1, "labeled", label="lane:Platform", sender="alice"))
         self.assertEqual(S.guard_sweep(self.gh()), ([], []))
         self.assertEqual(self.labels(1), ["lane:Platform", "sb:todo", "signalbox"])
+
+    def test_a_lane_owner_cannot_take_work_in_no_lane(self):
+        self.sb("propose", "-", "Work in no lane", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.as_("dave").add_labels(1, ["lane:Ops"])
+        self.assertIn("move approved work into lane Ops", self.guard(1, "labeled", label="lane:Ops", sender="dave"))
+        self.assertEqual(self.labels(1), ["sb:todo", "signalbox"])
+
+    def test_a_lane_owner_moves_work_between_their_lanes(self):
+        self.sb("propose", "Ops", "Ops work", **self.bot)
+        self.sb("approve", "SB-1", user="dave", tty=True)
+        self.sb("edit", "SB-1", "--lane", "Infra", user="dave", tty=True)
+        self.assertIsNone(self.guard(1, "labeled", label="lane:Infra", sender="dave"))
+        self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+        self.assertEqual(self.labels(1), ["lane:Infra", "sb:todo", "signalbox"])
+        # and out of them, into a lane that is not theirs, takes that lane's approvers, as in the CLI
+        self.assertIn("up to @alice", self.sb("edit", "SB-1", "--lane", "Docs", user="dave", tty=True, code=None))
+        d = self.as_("dave")
+        d.remove_label(1, "lane:Infra")
+        d.add_labels(1, ["lane:Docs"])
+        self.assertIn("move approved work into lane Docs", self.guard(1, "labeled", label="lane:Docs", sender="dave"))
+        # taking it out of Infra was dave's to do; it is in no lane now, where the approvers of no lane decide
+        hub = self.hub()
+        self.assertEqual((self.labels(1), hub.approvers_for(hub.issue(1))), (["sb:todo", "signalbox"], {"alice"}))
+
+    def test_agents_rule_proposals_out_of_scope_but_rewrite_no_scope(self):
+        self.sb("map", "new", "Login", "--destination", "Users log in with SSO", "--lane", "Docs", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("propose", "Docs", "Passkeys", "--map", "SB-1", "--kind", "research", **self.bot)  # SB-2, a proposal
+        self.sb("scope-out", "SB-2", "-m", "Beyond the destination", **self.bot)
+        self.assertIsNone(self.guard(1, "edited", sender="acme-bot"))
+        self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+        scope = S.section(S.split_body(self.as_("alice").get_issue(1)["body"])[0], "Out of scope")
+        self.assertRegex(scope, r"^- \[Passkeys\]\([^)]*#2\): Beyond the destination$")
+        # erasing that line, or adding one no ticket ruled, is not the agents'
+        for text in ("", scope + "\n- [Security review](#9): not needed, says @alice"):
+            changes = self.rewrite(1, fn=lambda d, text=text: S.set_section(d, "Out of scope", text))
+            self.assertIn("rewrite a map's scope", self.guard(1, "edited", sender="acme-bot", changes=changes))
+            self.assertEqual(S.section(S.split_body(self.as_("alice").get_issue(1)["body"])[0], "Out of scope"), scope)
 
     def test_a_second_lane_opens_no_way_into_a_chain(self):
         self.sb("propose", "Docs", "Member", **self.bot)
