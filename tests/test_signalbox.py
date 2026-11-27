@@ -1860,6 +1860,96 @@ class GuardVerifySeventh(World):
         self.assertIn("  > ", brief.split(S.EDITED_LABEL, 1)[1])
 
 
+class GuardVerifyEighth(World):
+    """The eighth verification of the guard: each scenario as the reviewer wrote it, and the legitimate flows."""
+
+    config = GuardVerifySeventh.config
+    as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
+    bot = dict(user="acme-bot", agent="claude-code")
+    gh, rewrite = GuardVerifyFifth.gh, GuardVerifySixth.rewrite
+
+    def test_a_map_costs_one_read_of_comments_per_ticket(self):
+        self.sb("map", "new", "Login", "--destination", "Users log in with SSO", "--lane", "Docs", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        for i in range(12):  # the agent rules out its own proposals, one map edit each
+            self.sb("propose", "Docs", f"Idea {i}", "--map", "SB-1", "--kind", "research", **self.bot)
+            self.sb("scope-out", f"SB-{i + 2}", "-m", f"Not needed {i}", **self.bot)
+        calls = []
+        real = S.FileTracker.list_comments
+        with mock.patch.object(S.FileTracker, "list_comments", lambda self_, n: calls.append(n) or real(self_, n)):
+            self.assertIsNone(self.guard(1, "edited", sender="acme-bot"))
+        self.assertLessEqual(len(calls), 14)
+
+    def test_a_flood_of_allowed_edits_never_blinds_the_guard(self):
+        self.sb("propose", "Docs", "Security review", **self.bot)
+        self.sb("propose", "Docs", "Tag the release", "Run the tests and get security's sign-off first.", "--deps", "SB-1", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        t = self.as_("acme-bot")
+        real = S.FileTracker.body_revisions
+        window = lambda self_, n: (lambda revs: revs if len(revs) <= 12 else [dict(revs[-12], cut=True)] + revs[-11:])(real(self_, n))
+        with mock.patch.object(S, "ANCHOR_EVERY", 5), mock.patch.object(S.FileTracker, "body_revisions", window):
+            for i in range(30):  # meta edits an agent may make (its declared paths), as GitHub keeps only the newest
+                d, m = S.split_body(t.get_issue(2)["body"])
+                t.update_issue(2, body=S.join_body(d, dict(m, paths=[f"src/{i}"])))
+                self.guard(2, "edited", sender="acme-bot")
+            changes = self.rewrite(2, fn=lambda d: "Tag it now; no review needed.")
+            self.assertIn("rewrite approved work", self.guard(2, "edited", sender="acme-bot", changes=changes))
+        self.assertEqual(S.split_body(t.get_issue(2)["body"])[0], "Run the tests and get security's sign-off first.")
+
+    def test_a_deleted_version_is_a_gap_in_the_history(self):
+        hub = self.gh()
+        revs = [{"body": "v1", "editor": "alice", "at": "2026-01-01T00:00:00Z"},
+                {"body": "", "editor": "alice", "at": "2026-01-02T00:00:00Z", "deleted": True},
+                {"body": "v3", "editor": "acme-bot", "at": "2026-01-03T00:00:00Z"}]
+        self.assertIsNone(S.history_walk(hub, revs))
+        revs.append({"body": "v3", "editor": "github-actions[bot]", "at": "2026-01-04T00:00:00Z"})
+        self.assertEqual([r["body"] for r in S.history_walk(hub, revs)], ["v3"])
+
+    def test_with_a_guard_of_its_own_no_bot_rewrites_approved_work(self):
+        path = os.path.join(self.alice, ".signalbox", "config.json")
+        cfg = json.loads(read(path))
+        cfg["guard"] = {"logins": ["acme-guard"]}
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        sh("git", "commit", "-qam", "The guard's own account", cwd=self.alice)
+        self.sb("propose", "Docs", "Release", "Tag only after the security review.", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        changes = self.rewrite(1, "Tag now; the review is not needed.", who="github-actions[bot]")
+        out = S.guard_event(self.hub(user="acme-guard"), {"action": "edited", "issue": {"number": 1},
+                                                           "sender": {"login": "github-actions[bot]"}, "changes": changes})
+        self.assertIn("rewrite approved work by @github-actions[bot]", out)
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(1)["body"])[0], "Tag only after the security review.")
+
+    def test_a_lane_taken_off_a_proposal_long_ago_is_no_move(self):
+        self.sb("propose", "Ops", "Triage me", **self.bot)
+        self.as_("dave").remove_label(1, "lane:Ops")  # dave triages the proposal out of his lane
+        self.sb("approve", "SB-1", tty=True)  # alice approves it in no lane
+        self.as_("dave").add_labels(1, ["lane:Infra"])
+        self.assertIn("move approved work into lane Infra", self.guard(1, "labeled", label="lane:Infra", sender="dave"))
+
+    def test_a_decision_reopened_and_resolved_again_adds_its_new_answer(self):
+        self.sb("map", "new", "Auth", "--destination", "Users log in", "--lane", "Docs", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("propose", "Docs", "Pick a provider", "--map", "SB-1", "--kind", "research", **self.bot)
+        self.sb("approve", "SB-2", tty=True)
+        self.sb("propose", "Docs", "Auth head", "--deps", "SB-2", tty=True)
+        self.sb("yolo", "SB-3", "on", tty=True)
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        self.sb("resolve", "SB-2", "-m", "GitHub OAuth", **self.bot)
+        self.guard(2, "closed", sender="acme-bot")
+        a = self.as_("alice")
+        a.update_issue(2, state="open")
+        a.add_labels(2, ["sb:todo"])
+        self.assertIsNone(self.guard(2, "reopened", sender="alice"))
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        self.sb("resolve", "SB-2", "-m", "Okta, after all", **self.bot)
+        self.guard(2, "closed", sender="acme-bot")
+        self.assertIsNone(self.guard(1, "edited", sender="acme-bot"))
+        self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+        decisions = S.section(S.split_body(a.get_issue(1)["body"])[0], "Decisions so far")
+        self.assertEqual([line.rsplit(": ", 1)[1] for line in decisions.splitlines()], ["GitHub OAuth", "Okta, after all"])
+
+
 class Security(World):
     """Each test pins down a hole that was open: who may act as whom, what text agents trust, what reaches git."""
 

@@ -189,7 +189,7 @@ def safe_json(text, limit=65536):
         return None
 
 
-META_KEYS = ("by", "at", "deps", "map", "paths")
+META_KEYS = ("by", "at", "deps", "map", "paths", "guarded")
 MAX_DEPS = 200  # more is no plan anyone reads, and only costs whoever walks the graph
 
 
@@ -206,7 +206,7 @@ def clean_meta(meta):
         out["paths"] = [p for p in strs(out["paths"]) if len(p) <= 300][:50]
     if "map" in out and not (isinstance(out["map"], int) and not isinstance(out["map"], bool)):
         out.pop("map")
-    for key in ("by", "at"):
+    for key in ("by", "at", "guarded"):
         if key in out and not (isinstance(out[key], str) and len(out[key]) <= 100):
             out.pop(key)
     out.pop("kind", None)  # a kind lives in its label, which the guard watches
@@ -679,6 +679,10 @@ def default_user():
 # public repository) are shown to agents as outside text: information, never instructions.
 TEAM_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 EDIT_PAGES = 10  # pages of a hundred versions the guard reads of a description's history
+# After this many versions without one of its own, the guard writes one (the same text, a new "guarded" stamp in the
+# meta), so a history never grows past what it reads without a version known good to walk from.
+ANCHOR_EVERY = 300
+MOVE_SECONDS = 120  # a lane taken off and another put on by the same account this soon after is one move
 TRUSTED_BOTS = frozenset({"github-actions[bot]"})  # every workflow of the repository, on any branch, writes as it
 
 
@@ -942,7 +946,7 @@ class GitHubTracker:
         cannot be read, or does not end in the body as it is now."""
         q = ("query($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,name:$r){issue(number:$n){body createdAt "
              "author{login __typename} userContentEdits(first:100,after:$c){pageInfo{hasNextPage endCursor} "
-             "nodes{editedAt editor{login __typename} diff}}}}}")
+             "nodes{editedAt deletedAt editor{login __typename} diff}}}}}")
         owner, name = self.repo.split("/", 1)
 
         def who(actor):
@@ -968,7 +972,8 @@ class GitHubTracker:
             return None
         if not nodes:  # never edited: the body it was opened with, by whoever opened it
             return [{"at": issue.get("createdAt"), "editor": who(issue.get("author")), "body": issue.get("body") or ""}]
-        out = [{"at": x.get("editedAt"), "editor": who(x.get("editor")), "body": x.get("diff") or ""} for x in reversed(nodes)]
+        out = [dict({"at": x.get("editedAt"), "editor": who(x.get("editor")), "body": x.get("diff") or ""},
+                    **({"deleted": True} if x.get("deletedAt") or x.get("diff") is None else {})) for x in reversed(nodes)]
         if out[-1]["body"].strip() != (issue.get("body") or "").strip():
             return None
         if cut:
@@ -4020,8 +4025,10 @@ class GuardBlind(SignalboxError):
 
 
 def guard_restricted(rules, actor, issue):
-    """Accounts that may not change approved work at all: agent accounts, and outsiders on the issues they opened."""
-    return actor in rules.team or (actor == login_of(issue.get("user")) and is_external(issue, rules.team))
+    """Accounts that may not change approved work at all: agent accounts, apps' bots other than the guard (every
+    workflow writes as github-actions[bot]), and outsiders on the issues they opened."""
+    return actor in rules.team or (actor or "").endswith("[bot]") and actor not in rules.guard_logins or \
+        (actor == login_of(issue.get("user")) and is_external(issue, rules.team))
 
 
 def board_state(labels, is_open=True, reason=None):
@@ -4055,7 +4062,7 @@ def guard_issues(hub):
 
 def guard_fresh(hub):
     """Forget what a run read, after the guard has changed the hub."""
-    for key in ("_guard_issues", "_guard_events", "_guard_revisions", "_guard_memo"):
+    for key in ("_guard_issues", "_guard_events", "_guard_revisions", "_guard_comments", "_guard_memo"):
         hub.__dict__.pop(key, None)
     hub.invalidate()
 
@@ -4072,6 +4079,14 @@ def guard_revisions(hub, n):
     cache = hub.__dict__.setdefault("_guard_revisions", {})
     if n not in cache:
         cache[n] = hub.tracker.body_revisions(n)
+    return cache[n]
+
+
+def guard_comments(hub, n):
+    """An issue's comments, read once per guard run (the guard's own comment makes guard_fresh forget them)."""
+    cache = hub.__dict__.setdefault("_guard_comments", {})
+    if n not in cache:
+        cache[n] = hub.tracker.list_comments(n)
     return cache[n]
 
 
@@ -4125,7 +4140,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
     sl = STATE_LABELS
     lanes_now = {x["label"]: x for x in hub.lanes()}
     legit = {"labels": set(), "open": True, "reason": None, "closed_from": None, "closed_at": None, "closed_by": None,
-             "marks": [], "grants": {}}
+             "done_closes": 0, "closes": 0, "marks": [], "grants": {}}
     violations = []
     created = parse_iso(issue.get("created_at"))
     author = login_of(issue.get("user"))
@@ -4144,6 +4159,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
             trace.append((parse_iso(e.get("created_at")) if e else None, e.get("id") if e else None,
                           {"labels": frozenset(legit["labels"]), "open": legit["open"], "reason": legit["reason"],
                            "closed_from": legit["closed_from"], "closed_at": legit["closed_at"], "closed_by": legit["closed_by"],
+                           "done_closes": legit["done_closes"], "closes": legit["closes"],
                            "grants": dict(legit["grants"])}))
 
     # The labels an issue is created with arrive as separate events; judge them as one change, the creation. GitHub
@@ -4173,7 +4189,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
             legit["grants"][label] = (author, created)
 
     snap()
-    left = None  # (lane, actor): the lane last taken off, until a lane goes on (a move takes the old off first)
+    left = None  # (lane, actor, when): the lane last taken off approved work (a move takes the old off first)
     for e in rest:
         kind, actor, label = e.get("event"), login_of(e.get("actor")), e.get("label")
         if kind in ("labeled", "unlabeled") and not guard_managed(label) or kind not in ("labeled", "unlabeled", "closed", "reopened"):
@@ -4209,7 +4225,9 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
                         # Those who decide where it is decide too: beside another lane, that lane's approvers; in no
                         # lane, the approvers of work in no lane, unless the same account just took it off a lane
                         # (a move, which adds the new lane after taking the old off), where that lane's do.
-                        also = (lane,) if lane else (just_left[0] if just_left and just_left[1] == actor else None,)
+                        moved = just_left and just_left[1] == actor and just_left[2] and t and \
+                            (t - just_left[2]).total_seconds() <= MOVE_SECONDS
+                        also = (lane,) if lane else (just_left[0] if moved else None,)
                     lane = lane_named(label, rules)
                 elif label.startswith(KIND_PREFIX) and approved:
                     decision = "change the kind of approved work"
@@ -4265,13 +4283,15 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
             if label in (YOLO_LABEL, YOLO_STOP_LABEL) and actor not in bots:
                 legit["grants"][label] = (actor, t)
         elif kind == "unlabeled":
-            if label.startswith(LANE_PREFIX) and label in labels:
-                left = (lane_named(label, rules), actor)
+            if label.startswith(LANE_PREFIX) and label in labels and approved:
+                left = (lane_named(label, rules), actor, t)  # judged, as approved work leaving its lane
             labels.discard(label)
             legit["grants"].pop(label, None) if actor not in bots else None
         elif kind == "closed":
             if is_open:
                 legit.update(closed_from=cur, closed_at=t, closed_by=actor)
+                legit["done_closes"] += reason == "completed"
+                legit["closes"] += 1
             legit.update(open=False, reason=reason)
         elif kind == "reopened":
             legit.update(open=True, reason=None, closed_from=None, closed_at=None, closed_by=None)
@@ -4279,14 +4299,14 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
     return legit, violations
 
 
-def replay_at(hub, issue, events, until=None, before=None):
+def replay_at(hub, issue, events, until=None, before=None, depth=1):
     """The legitimate state of an issue at a cut of its timeline (its events up to `until`, or before the event
-    numbered `before`), as guard_replay(depth=1) leaves it: one replay of each issue per run answers every cut."""
+    numbered `before`), as guard_replay(depth) leaves it: one replay of each issue per run answers every cut."""
     memo = hub.__dict__.setdefault("_guard_memo", {})
-    key = ("states", issue["number"], id(events))
+    key = ("states", issue["number"], id(events), depth)
     if key not in memo:
         trace = []
-        guard_replay(hub, issue, events, depth=1, trace=trace)
+        guard_replay(hub, issue, events, depth=depth, trace=trace)
         # Running maxima, so the first event past a cut is found by bisection even where stamps tie or step back.
         tops, top_t, top_i = ([], []), float("-inf"), float("-inf")
         for t, eid, _ in trace[1:]:
@@ -4408,9 +4428,9 @@ def note_trusted(note):
     return not note.get("external") and not note.get("edited")
 
 
-def resolution_gist(hub, ticket, until=None):
+def resolution_gist(hub, ticket, until=None, comments=None):
     """The gist of a ticket's latest answer (a resolution note from the team, as posted), as of `until`."""
-    for c in reversed(hub.tracker.list_comments(ticket["number"])):
+    for c in reversed(hub.tracker.list_comments(ticket["number"]) if comments is None else comments):
         note = parse_note(c, hub.team)
         at = parse_iso(note.get("at"))
         if until and at and at > until:
@@ -4421,23 +4441,44 @@ def resolution_gist(hub, ticket, until=None):
     return "resolved"
 
 
+def resolution_gists(hub, ticket, until, comments):
+    """The gists of every answer a ticket was given (resolution notes from the team, as posted) up to `until`:
+    GitHub's times are whole seconds, so a close and the answers around it cannot always be told apart."""
+    out = []
+    for c in comments:
+        note = parse_note(c, hub.team)
+        at = parse_iso(note.get("at"))
+        if until and at and at > until:
+            continue
+        if note.get("kind") == "resolution" and note_trusted(note) and note["text"].startswith("Resolution:"):
+            answer = note["text"][len("Resolution:"):].strip()
+            out.append(K._gist(answer) if answer else "resolved")
+    return out or ["resolved"]
+
+
 def legit_map_at(hub, ticket, cut):
-    """The map a ticket belonged to at a cut of its history, as its permitted authors left it; None where its
-    history cannot be read."""
+    """The map a ticket belonged to at a cut of its history, as its permitted authors left it, from one walk of
+    its history per run; None where its history cannot be read."""
     memo = hub.__dict__.setdefault("_guard_memo", {})
-    key = ("map_of", ticket["number"], tuple(sorted(cut.items())))
+    key = ("maps_of", ticket["number"])
     if key not in memo:
-        walk = history_walk(hub, guard_revisions(hub, ticket["number"])) or []
-        before, until = cut.get("before"), cut.get("until")
-        walk = [r for r in walk if not (isinstance(before, int) and isinstance(r.get("seq"), int) and r["seq"] >= before)
-                and not (until and parse_iso(r.get("at")) and parse_iso(r.get("at")) > until)]
-        if not walk:
-            memo[key] = None
-        elif len(walk) == 1:
-            memo[key] = split_body(walk[0].get("body"))[1].get("map")
-        else:
-            memo[key] = body_walk(hub, ticket, guard_events(hub, ticket["number"]), walk_steps(walk))[1].get("map")
-    return memo[key]
+        walk = history_walk(hub, guard_revisions(hub, ticket["number"]))
+        maps = []
+        if walk:
+            first = split_body(walk[0].get("body"))[1].get("map")
+            maps.append((walk[0].get("seq"), parse_iso(walk[0].get("at")), first))
+            if len(walk) > 1:  # depth 1: the map is all it is asked, and no map's own rules run (maps can point at each other)
+                body_walk(hub, ticket, guard_events(hub, ticket["number"]), walk_steps(walk), depth=1, maps=maps)
+        memo[key] = maps
+    maps, before, until = memo[key], cut.get("before"), cut.get("until")
+    if not maps:
+        return None
+    then = maps[0][2]
+    for seq, at, m in maps[1:]:
+        if isinstance(before, int) and isinstance(seq, int) and seq >= before or until and at and at > until:
+            break
+        then = m
+    return then
 
 
 def map_tickets(hub, map_n, cut, done):
@@ -4448,7 +4489,7 @@ def map_tickets(hub, map_n, cut, done):
         if ticket["number"] == map_n or split_body(ticket["body"])[1].get("map") != map_n:
             continue
         events = guard_events(hub, ticket["number"])
-        legit, _ = guard_replay(hub, ticket, events, **cut)
+        legit = replay_at(hub, ticket, events, depth=0, **cut)
         if legit["open"] or (legit["reason"] == "completed") != done or legit_map_at(hub, ticket, cut) != map_n:
             continue
         title = title_walk(hub, ticket, events, **cut)[0] or ticket["title"]
@@ -4462,15 +4503,17 @@ def ticket_ref(ticket):
 
 
 def decision_lines(hub, map_n, cut, editor):
-    """The Decisions so far lines account `editor` may add to map `map_n` at a cut: one for each decision ticket of
-    the map that `editor` itself closed as done (a finish under YOLO, whose own CLI adds the line; when a person
-    accepts one, theirs does), with its title then and its answer as posted before the close. {line: its ticket}."""
+    """The Decisions so far lines account `editor` may add to map `map_n` at a cut: for each decision ticket of the
+    map that `editor` itself closed as done (a finish under YOLO, whose own CLI adds the line; when a person accepts
+    one, theirs does), with its title then and an answer as posted by the close. {line: (its ticket, its state)};
+    map_by_agent lets in one line for each time the ticket was closed so."""
     memo = hub.__dict__.setdefault("_guard_memo", {})
     key = ("decisions", map_n, tuple(sorted(cut.items())), editor)
     if key not in memo:
-        memo[key] = {decision_line(ticket, resolution_gist(hub, ticket, until=legit.get("closed_at"))): ticket_ref(ticket)
+        memo[key] = {decision_line(ticket, gist): (ticket_ref(ticket), legit)
                      for ticket, legit in map_tickets(hub, map_n, cut, done=True)
-                     if kind_in(legit["labels"]) in DECISION_KINDS and legit.get("closed_by") == editor}
+                     if kind_in(legit["labels"]) in DECISION_KINDS and legit.get("closed_by") == editor
+                     for gist in resolution_gists(hub, ticket, legit.get("closed_at"), guard_comments(hub, ticket["number"]))}
     return memo[key]
 
 
@@ -4486,12 +4529,12 @@ def scope_lines(hub, map_n, cut, editor):
             if legit.get("closed_by") != editor:
                 continue
             closed = legit.get("closed_at")
-            for c in hub.tracker.list_comments(ticket["number"]):
+            for c in guard_comments(hub, ticket["number"]):
                 note = parse_note(c, hub.team)
                 at = parse_iso(note.get("at"))
                 if note.get("kind") == "event" and note_trusted(note) and note["text"].startswith("Out of scope:") and \
                         not (closed and at and at > closed):
-                    out[scope_line(ticket, note["text"][len("Out of scope:"):])] = ticket_ref(ticket)
+                    out[scope_line(ticket, note["text"][len("Out of scope:"):])] = (ticket_ref(ticket), legit)
         memo[key] = out
     return memo[key]
 
@@ -4517,10 +4560,15 @@ def map_by_agent(hub, issue, good, new, cut, editor):
             continue
         lines = allowed(hub, issue["number"], cut, editor)
         added = new_l[len(old_l):]
-        refs = [lines.get(x) for x in added]
-        if new_l[:len(old_l)] == old_l and all(refs) and len(set(refs)) == len(refs) and \
-                not any(ref in line for ref in refs for line in lines_of(section(good, "Decisions so far")) +
-                        lines_of(section(good, "Out of scope"))):
+        found = [lines.get(x) for x in added]
+        written = lines_of(section(good, "Decisions so far")) + lines_of(section(good, "Out of scope")) + added
+
+        def room(ref, legit):
+            """A line for each time the ticket was closed so: a decision reopened and resolved again adds a new one."""
+            closes = legit["done_closes"] if what == "decisions" else legit["closes"] - legit["done_closes"]
+            return sum(ref in line for line in written) <= closes
+        if new_l[:len(old_l)] == old_l and all(found) and len(set(added)) == len(added) and \
+                all(room(ref, legit) for ref, legit in found):
             keep = set_section(keep, name, section(new, name))
         else:
             refused.append(what)
@@ -4533,7 +4581,7 @@ def map_by_agent(hub, issue, good, new, cut, editor):
     return keep, refused
 
 
-def body_walk(hub, issue, events, steps, depth=0):
+def body_walk(hub, issue, events, steps, depth=0, maps=None):
     """Walk a description's versions [(body, editor, time)], keeping what each author was allowed to change: on
     approved work, agent accounts and outsiders change neither its description (of a map, only its fog, its scope
     and the decisions of its tickets that are done) nor its map nor drop its links, and only approvers link more
@@ -4567,8 +4615,9 @@ def body_walk(hub, issue, events, steps, depth=0):
         labels_then = state_then["labels"] if state_then else set(issue["labels"])
         lane = guard_lane_in(hub, rules, labels_then)
         restricted = guard_restricted(rules, editor, issue)
-        if depth:
-            pass  # what the links were is all a depth-1 walk is asked
+        if depth:  # what the links and the map were is all a depth-1 walk is asked
+            if not (approved and restricted):
+                good_meta["map"] = r_meta.get("map")
         elif approved and restricted:
             if r_desc != good_desc and kind_in(labels_then) == "map":
                 # the map as it was when this version was written, that second included: a ticket's close and
@@ -4604,17 +4653,22 @@ def body_walk(hub, issue, events, steps, depth=0):
                 old |= new - old
         good_meta["deps"] = sorted(old)
         good_meta.update({k: v for k, v in r_meta.items() if k not in ("deps", "map")})
+        if maps is not None:
+            maps.append((seq, t, good_meta.get("map")))
     return good_desc, good_meta, undone
 
 
 def history_walk(hub, revisions):
-    """The versions of a description to walk: all of them; where GitHub's history is cut off, those from the newest
-    version the guard wrote (it writes only versions it found good); None where neither can be had."""
+    """The versions of a description to walk: all of them; where GitHub's history is cut off, or a version was
+    deleted from it, those from the newest version the guard wrote after the gap (it writes only versions it found
+    good); None where neither can be had."""
     if not revisions:
         return None
-    if not revisions[0].get("cut"):
+    deleted = [i for i, r in enumerate(revisions) if r.get("deleted")]
+    if not deleted and not revisions[0].get("cut"):
         return revisions
-    for i in range(len(revisions) - 1, -1, -1):
+    start = deleted[-1] + 1 if deleted else 0  # the oldest version read is whole; a deleted one is not
+    for i in range(len(revisions) - 1, start - 1, -1):
         if guard_wrote(hub, revisions[i].get("editor"), parse_iso(revisions[i].get("at"))):
             return [dict(r, cut=False) for r in revisions[i:]]
     return None
@@ -4726,7 +4780,6 @@ def guard_texts(hub, issue, events, edit=None):
     if len(steps) < 2:
         return fixes, undone, pulled, None
     good_desc, good_meta, walked = body_walk(hub, issue, events, steps)
-    undone += walked
     desc, meta = split_body(issue["body"])
     issues = {i["number"]: i for i in guard_issues(hub)}
 
@@ -4743,7 +4796,14 @@ def guard_texts(hub, issue, events, edit=None):
     body = join_body(good_desc, new_meta)
     if (good_desc, deps, new_meta.get("map")) != (desc, sorted(meta.get("deps") or []), meta.get("map")):
         fixes["body"] = body
-    return fixes, undone, pulled if "body" in fixes else set(), None
+        undone += walked
+    else:
+        since = next((k for k, r in enumerate(reversed(walk)) if guard_wrote(hub, r.get("editor"), parse_iso(r.get("at")))),
+                     len(walk))
+        if since >= ANCHOR_EVERY:  # a version of its own, so a flood of edits never blinds it
+            # stamped with the count too: two anchors in one second must still differ, or no version is made
+            fixes["body"] = join_body(desc, dict(meta, guarded=f"{iso(now())} after {len(walk)} versions"))
+    return fixes, undone, pulled if "body" in fixes and pulled else set(), None
 
 
 def guard_reconcile(hub, n, edit=None):
