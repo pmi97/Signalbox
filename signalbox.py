@@ -192,6 +192,7 @@ def safe_json(text, limit=65536):
 
 META_KEYS = ("by", "at", "deps", "map", "paths", "guarded", "struck")
 MAX_DEPS = 200  # more is no plan anyone reads, and only costs whoever walks the graph
+MAX_STRUCK = 64  # lines struck off a map the guard remembers (the newest), so its own writes stay small
 
 
 def clean_meta(meta):
@@ -211,7 +212,7 @@ def clean_meta(meta):
         if key in out and not (isinstance(out[key], str) and len(out[key]) <= 100):
             out.pop(key)
     if "struck" in out:
-        out["struck"] = [x for x in strs(out["struck"]) if len(x) <= 16][:500]
+        out["struck"] = [x for x in strs(out["struck"]) if len(x) <= 16][-MAX_STRUCK:]
     out.pop("kind", None)  # a kind lives in its label, which the guard watches
     return out
 
@@ -4618,9 +4619,11 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
             yolo_covered_at(hub, issue["number"], cut.get("until") or t, event_id=cut.get("before"), depth=1, lane=None)
 
     good_desc, good_meta = split_body(steps[0][0])
-    # Lines people struck off a map, from the version the walk starts at (a walk from the guard's own version picks
-    # up what it knew; a list anyone else wrote only makes the guard stricter) and from what it reads.
-    undone, struck = [], set(good_meta.get("struck") or [])
+    # Lines people struck off a map: from the version the walk starts at only if the guard wrote it (a list anyone
+    # else wrote would ride into every write the guard makes), then from what the walk reads.
+    first = tuple(steps[0]) + (None,) * (4 - len(steps[0]))
+    struck = list(good_meta.pop("struck", None) or []) if first[1] and guard_wrote(hub, first[1], first[2]) else []
+    undone = []
     for body, editor, t, seq in [tuple(x) + (None,) * (4 - len(x)) for x in steps[1:]]:
         rules = hub.at(t)
         if editor in rules.guard_logins:
@@ -4661,7 +4664,8 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
         else:
             if not restricted and not depth:  # a person's taking a line off a map is their decision, and stays
                 for name in ("Decisions so far", "Out of scope"):
-                    struck |= {line_print(x) for x in set(lines_of(section(good_desc, name))) - set(lines_of(section(r_desc, name)))}
+                    gone = [x for x in lines_of(section(good_desc, name)) if x not in lines_of(section(r_desc, name))]
+                    struck = [x for x in struck if x not in {line_print(g) for g in gone}] + [line_print(g) for g in gone]
             good_desc = r_desc
             good_meta["map"] = r_meta.get("map")
         old, new = set(good_meta.get("deps") or []), set(r_meta.get("deps") or [])
@@ -4676,11 +4680,15 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
             else:
                 old |= new - old
         good_meta["deps"] = sorted(old)
-        good_meta.update({k: v for k, v in r_meta.items() if k not in ("deps", "map", "struck")})
+        theirs = {k: v for k, v in r_meta.items() if k not in ("deps", "map", "struck")}
+        if approved and restricted:
+            good_meta.update(theirs)  # an agent sets what it may (its paths), and takes nothing away
+        else:
+            good_meta = dict({k: good_meta[k] for k in ("deps", "map") if k in good_meta}, **theirs)
         if maps is not None:
             maps.append((seq, t, good_meta.get("map")))
     if struck:
-        good_meta["struck"] = sorted(struck)
+        good_meta["struck"] = struck[-MAX_STRUCK:]
     return good_desc, good_meta, undone
 
 
@@ -4825,6 +4833,9 @@ def guard_texts(hub, issue, events, edit=None):
     pulled = set(meta.get("deps") or []) - set(deps)
     new_meta = dict(good_meta, deps=deps, map=good_meta.get("map"))
     body = join_body(good_desc, new_meta)
+    if len(body) > BODY_LIMIT and new_meta.get("struck"):  # what was struck is worth less than the fix itself
+        new_meta.pop("struck")
+        body = join_body(good_desc, new_meta)
     def comparable(m):  # what a version says, less the guard's own bookkeeping
         return {k: sorted(v) if k == "deps" else v for k, v in m.items() if k not in ("guarded", "struck") and v not in (None, [], "")}
     if (good_desc, comparable(new_meta)) != (desc, comparable(meta)):
@@ -4835,8 +4846,9 @@ def guard_texts(hub, issue, events, edit=None):
                      len(walk))
         if since >= ANCHOR_EVERY:  # a version of its own, so a flood of edits never blinds it
             # stamped with the count too: two anchors in one second must still differ, or no version is made
-            anchor = join_body(desc, dict(meta, guarded=f"{iso(now())} after {len(walk)} versions",
-                                          **({"struck": good_meta["struck"]} if good_meta.get("struck") else {})))
+            stamp = dict(meta, guarded=f"{iso(now())} after {len(walk)} versions")
+            anchor = join_body(desc, dict(stamp, **({"struck": good_meta["struck"]} if good_meta.get("struck") else {})))
+            anchor = anchor if len(anchor) <= BODY_LIMIT else join_body(desc, stamp)
             if len(anchor) <= BODY_LIMIT:
                 fixes["body"] = anchor
     return fixes, undone, pulled if "body" in fixes and pulled else set(), None

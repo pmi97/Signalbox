@@ -2072,6 +2072,43 @@ class GuardVerifyTenth(World):
         self.assertEqual(S.split_body(self.as_("alice").get_issue(1)["body"])[1].get("paths"), ["src/importer/**"])
 
 
+class GuardVerifyEleventh(World):
+    """The eleventh verification of the guard."""
+
+    config = GuardVerifySeventh.config
+    as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
+    bot = dict(user="acme-bot", agent="claude-code")
+    gh, rewrite = GuardVerifyFifth.gh, GuardVerifySixth.rewrite
+
+    def test_a_struck_list_only_the_guard_wrote_counts(self):
+        planted = [f"{i:016x}" for i in range(500)]
+        hub = self.hub(**self.bot)
+        hub.tracker.create_issue("Login", S.join_body(S.map_template("Users log in with SSO"), {"struck": planted}),
+                                 ["signalbox", "lane:Docs", "kind:map", "sb:proposed"])
+        self.sb("approve", "SB-1", tty=True)
+        changes = self.rewrite(1, fn=lambda d: S.set_section(d, "Destination", "Skip login."))
+        self.assertIn("rewrite a map's text", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        meta = S.split_body(self.as_("alice").get_issue(1)["body"])[1]
+        self.assertLessEqual(len(meta.get("struck") or []), S.MAX_STRUCK)
+        self.assertEqual(S.section(S.split_body(self.as_("alice").get_issue(1)["body"])[0], "Destination"), "Users log in with SSO")
+
+    def test_a_person_may_take_a_meta_field_away(self):
+        self.sb("propose", "Docs", "Work", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("claim", "SB-1", "--no-worktree", "--paths", "src/c/**", **self.bot)
+        a = self.as_("alice")
+        d, m = S.split_body(a.get_issue(1)["body"])
+        a.update_issue(1, body=S.join_body(d, {k: v for k, v in m.items() if k != "paths"}))
+        self.assertIsNone(self.guard(1, "edited", sender="alice"))
+        self.assertIsNone(S.split_body(a.get_issue(1)["body"])[1].get("paths"))
+        # an agent cannot take one away from approved work
+        t = self.as_("acme-bot")
+        d, m = S.split_body(t.get_issue(1)["body"])
+        t.update_issue(1, body=S.join_body(d, {k: v for k, v in m.items() if k != "by"}))
+        self.guard(1, "edited", sender="acme-bot")
+        self.assertIn("by", S.split_body(a.get_issue(1)["body"])[1])
+
+
 class Security(World):
     """Each test pins down a hole that was open: who may act as whom, what text agents trust, what reaches git."""
 
