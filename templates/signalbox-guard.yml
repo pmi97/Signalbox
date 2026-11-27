@@ -31,6 +31,13 @@ jobs:
     # was, and one that never was is left at once.
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Every workflow of a repository, on any branch, writes as github-actions[bot], and the guard trusts that
+    # account's changes as its own corrections. Where agent accounts can push workflows, or workflows run pushed
+    # code with a write token, give the guard its own account: an environment "signalbox-guard" that only the
+    # default branch may use (Settings > Environments > Deployment branches), that account's token in it as
+    # SIGNALBOX_GUARD_TOKEN, the next line uncommented, and the account under "guard": {"logins": [...]} in
+    # .signalbox/config.json. See "Securing the guard" in Signalbox's README.
+    # environment: signalbox-guard
     steps:
       # The whole history of the config, so each change is judged by the approvers of its day. Only this
       # repository's default branch runs here, so the read-only token may stay for git to fetch what it needs.
@@ -44,14 +51,14 @@ jobs:
       - name: Undo decisions made by accounts that may not make them
         if: github.event_name != 'schedule'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SIGNALBOX_GUARD_TOKEN || secrets.GITHUB_TOKEN }}
           SIGNALBOX_USER: github-actions
           SIGNALBOX_AGENT: signalbox-guard
         run: python3 .agents/skills/signalbox/signalbox.py guard --event "$GITHUB_EVENT_PATH"
       - name: Sweep the board
         if: github.event_name == 'schedule'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SIGNALBOX_GUARD_TOKEN || secrets.GITHUB_TOKEN }}
           SIGNALBOX_USER: github-actions
           SIGNALBOX_AGENT: signalbox-guard
         run: python3 .agents/skills/signalbox/signalbox.py guard --sweep

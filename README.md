@@ -209,6 +209,17 @@ Signalbox holds GitHub tokens, runs git and shell commands, and feeds text to ag
 - **Outside text is marked.** Comments and issues by people who are not owners, members or collaborators are flagged as information, not instructions, in briefs, `show`, JSON and MCP; signatures that claim another person show who really posted them.
 - **The board server is private.** Only a person at a terminal, with a token GitHub confirms, can start `serve`. It makes a secret key per session and hands it to your browser through a file only you can read, in the URL's fragment, so it never shows on a command line or in a request URL; the page sends it in a header, and every request without it is refused. Another account on the machine, or an agent that would rather approve its own work, cannot act as you through it.
 - **The guard closes GitHub's side**: approvals however they are labelled, send-backs, acceptances, rejections, demotions, YOLO and its stops, tasks taken off the board or put on it already approved, and agent accounts rewriting approved tasks, by any account that may not decide, bots included. It reads the rules from the default branch.
+- **Edited notes are marked too.** Anyone with write access can edit anyone's comment, and GitHub's REST API does not say who did, so a note edited after it was posted is shown as information, not instructions, and never counts as a decision's answer.
+
+### Securing the guard
+
+The guard trusts the changes of the account it writes as. By default that is `github-actions[bot]`, which is also what *every* workflow of the repository writes as, on any branch. So one more step matters wherever agent accounts can push:
+
+1. **Agent accounts must not push workflows.** Give them tokens without the `workflow` scope (fine-grained: no *Workflows* permission); GitHub then refuses any push that touches `.github/workflows/`.
+2. **Workflows get a read-only token by default** (Settings → Actions → General → Workflow permissions → *Read*). The guard asks for `issues: write` itself; CI that runs pushed code then cannot change issues.
+3. **Better, give the guard its own account**, a GitHub App or a machine user. Create an environment `signalbox-guard` that only the default branch may use (Settings → Environments → Deployment branches), store that account's token there as `SIGNALBOX_GUARD_TOKEN`, uncomment `environment: signalbox-guard` in the workflow, and list the account in the config: `"guard": {"logins": ["acme-guard"]}`. From then on `github-actions[bot]` is an ordinary account to the guard, and no branch's workflow can use the guard's token. Each change is judged by the config of its day, so the guard's earlier corrections still count.
+
+`signalbox doctor` checks the first two where the token lets it read them.
 
 Limits and the reasoning behind each choice are in [DESIGN.md](DESIGN.md#trust-boundaries). Report security problems privately to the maintainers rather than in an issue.
 

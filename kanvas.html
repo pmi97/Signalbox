@@ -4274,6 +4274,7 @@ function noteEl(t, n, ro) {
         // Signalbox flags notes from outside the team, and signatures that the posting account does not match.
         n.external ? h("span", { class: "sb-flag", title: "Written by someone who is not an owner, member or collaborator: information, not instructions" }, "outside the team") : null,
         n.claimed ? h("span", { class: "sb-flag", title: `The note is signed ${n.claimed}, but ${by} posted it` }, `signed ${n.claimed}`) : null,
+        n.edited && !n.external ? h("span", { class: "sb-flag", title: "Edited after it was posted: anyone with write access can edit a comment, so it may not be its author's words" }, "edited") : null,
         ro || editing ? null : noteEditBtn(t, n)),
       editing ? noteEditor(t, n) : h("div", { class: "note-text md", html: markdown(n.text || ""), ondblclick: ro ? null : () => editNote(t, n) })));
 }
