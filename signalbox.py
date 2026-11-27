@@ -543,6 +543,8 @@ class FileTracker:
                      "state": "open", "state_reason": None, "assignees": list(assignees), "user": self.whoami(),
                      "created_at": stamp, "updated_at": stamp, "url": f"{self.describe()}#{n}"}
             data["issues"][str(n)] = issue
+            for lab in issue["labels"]:  # as GitHub makes a label it is given that does not exist yet
+                data["labels"].setdefault(lab, {"color": "ededed", "description": ""})
             data["event_seq"] = data.get("event_seq", 0) + 1  # a version has its own place in the sequence
             data.setdefault("revisions", {})[str(n)] = [{"at": stamp, "editor": self.whoami(), "body": body,
                                                          "seq": data["event_seq"]}]
@@ -579,6 +581,7 @@ class FileTracker:
             for lab in labels:
                 if lab not in issue["labels"]:
                     self._event(data, number, "labeled", label=lab, birth=False)
+                data["labels"].setdefault(lab, {"color": "ededed", "description": ""})  # as GitHub makes a new one
             issue["labels"] = list(dict.fromkeys(issue["labels"] + list(labels)))
             self._touch(issue)
         self._tx(fn)
@@ -1496,6 +1499,8 @@ def parse_note(comment, team=frozenset()):
         note["claimed"] = claimed
     if is_external(comment, team):
         note["external"] = True
+    if real in team:  # an agent account's, whatever name it signs
+        note["agent_account"] = True
     c, u = parse_iso(comment.get("created_at")), parse_iso(comment.get("updated_at"))
     if c and u and (u - c).total_seconds() > 2:
         note["edited"] = comment["updated_at"]
@@ -2991,10 +2996,13 @@ def team_view(t):
 
 
 def sent_back(t):
-    """The feedback a task was sent back with, while it waits to be picked up again."""
+    """The feedback a task was sent back with, while it waits to be picked up again: a person's own words, as they
+    posted them (an agent's note, or one edited since, is no reviewer's feedback, however it is worded)."""
     for note in reversed(t.get("notes") or []):
         if note.get("kind") == "summary" or note.get("kind") == "resolution":
             return None
+        if not (K.is_human(note.get("by")) and note_trusted(note) and not note.get("agent_account")):
+            continue
         if note.get("kind") == "feedback" or str(note.get("text", "")).startswith("Sent back:"):
             return note["text"][len("Sent back:"):].strip() if note["text"].startswith("Sent back:") else note["text"]
     return None
@@ -4877,7 +4885,7 @@ def guard_texts(hub, issue, events, edit=None):
     return fixes, undone, pulled if "body" in fixes and pulled else set(), None
 
 
-def guard_reconcile(hub, n, edit=None):
+def guard_reconcile(hub, n, edit=None, force=frozenset()):
     """Replay issue `n` and put its labels, state, title and description back to what its legitimate history
     leaves. Returns what was undone, or None."""
     tracker = hub.tracker
@@ -4892,10 +4900,14 @@ def guard_reconcile(hub, n, edit=None):
     # Lanes follow the legitimate state only where a refused move touched them, and only with labels that still
     # exist: lanes get renamed and removed without events on their issues.
     touched = {LANE_PREFIX + d.split(" lane ", 1)[1] for _, d, _ in violations if " lane " in d}
+    touched |= {x for x in force if x.startswith(LANE_PREFIX)}
     existing = {lab["name"] for lab in hub.labels()} | {lane["label"] for lane in hub.lanes()}
     want = {x for x in legit["labels"] if not x.startswith(LANE_PREFIX) or (x in touched and x in existing)}
     have = {x for x in current if not x.startswith(LANE_PREFIX) or x in touched}
     add, remove = (sorted(want - have), sorted(have - want)) if violations else ([], [])
+    # Labels the repository lost or renamed (no event on any issue): put back by name, refused change or not.
+    lost = sorted(((want - have) | (have - want)) & set(force) - set(add) - set(remove)) if force else []
+    add, remove = sorted(set(add) | {x for x in lost if x in want}), sorted(set(remove) | {x for x in lost if x in have})
     is_open = issue["state"] == "open"
     reopen = violations and legit["open"] and not is_open
     close = violations and not legit["open"] and is_open
@@ -4935,6 +4947,7 @@ def guard_reconcile(hub, n, edit=None):
             "outside the team" if actor == login_of(issue.get("user")) and is_external(issue, hub.team) else "not an approver here"
         lines.append(f"- **{decision}** by @{actor}, who is {who}")
     lines += [f"- {u}" for u in text_undone] if text_fixes else []
+    lines += [f"- labels changed for the whole repository, put back here: {', '.join(lost)}"] if lost else []
     if lines or refused:
         parts = ["Undid what only an approver may do:\n" + "\n".join(dict.fromkeys(lines))] if lines else []
         parts += ["Could not do all it should:\n" + "\n".join(f"- {r}" for r in dict.fromkeys(refused))] if refused else []
@@ -4953,24 +4966,74 @@ def guard_reconcile(hub, n, edit=None):
     done += [f"undid {u} on #{n}" for u in text_undone] if text_fixes else []
     if mark and not done:
         done.append(f"marked #{n} done under YOLO")
+    if lost:
+        done.append(f"put back {', '.join(lost)} on #{n}")
     if refused:
         raise SignalboxError(f"#{n}: " + "; ".join(refused))
     return "; ".join(dict.fromkeys(done)) or None
 
 
+def watched_labels(hub):
+    """The labels a board's decisions live in: deleting or renaming one at repository level changes every issue
+    that wore it, and GitHub records no event on any of them."""
+    return (set(LABEL_COLORS) - {LOCK_LABEL}) | {KIND_PREFIX + k for k in KINDS[1:]} | \
+        {x["label"] for x in hub.lanes() if x.get("configured")}
+
+
+def guard_labels(hub):
+    """Put the board's labels back after a change at repository level: make the missing ones again, then give
+    every board issue the ones its legitimate history leaves, by name. Returns (what was put back, errors)."""
+    force = watched_labels(hub)
+    hub._labels = None
+    hub.ensure_labels()
+    out, errors = [], []
+    issues = {i["number"] for i in hub.tracker.list_issues(MARK)}
+    # The board label itself may be the one gone: board issues are also known by the meta Signalbox writes.
+    issues |= {i["number"] for i in hub.tracker.list_issues(None) if split_body(i.get("body") or "")[1]}
+    for n in sorted(issues):
+        try:
+            done = guard_reconcile(hub, n, force=force)
+        except Exception as e:  # one issue's trouble never stops the others
+            errors.append(f"#{n}: {type(e).__name__}: {e}")
+            done = None
+        if done:
+            out.append(done)
+        guard_fresh(hub)
+    return out, errors
+
+
 def guard_event(hub, event):
     """Undo human-only decisions made on GitHub by accounts that may not make them. Returns what was undone."""
     issue = event.get("issue") or {}
+    label = event.get("label") if isinstance(event.get("label"), dict) else {}
+    if not issue.get("number") and label and event.get("action") in ("deleted", "edited"):
+        old = ((event.get("changes") or {}).get("name") or {}).get("from")
+        if {label.get("name"), old} & watched_labels(hub):
+            out, errors = guard_labels(hub)
+            if errors:
+                raise SignalboxError("; ".join(errors))
+            return "\n".join(out) or None
+        return None
     if not issue.get("number"):
         return None
     return guard_reconcile(hub, issue["number"], edit=event if event.get("action") == "edited" else None)
 
 
-def guard_sweep(hub, days=1):
+def guard_sweep(hub, days=3):
     """Judge every issue changed in the last `days`, on the board or taken off it: what a failed or cancelled run
     left, the sweep puts right. Returns (undone, errors); one issue's trouble never stops the others."""
     since = iso(now() - timedelta(days=days))
     out, errors = [], []
+    hub._labels = None
+    missing = watched_labels(hub) - {lab["name"] for lab in hub.labels()}
+    if missing:
+        # A board label is gone, with no event on any issue. If issues wore it lately, put every board issue's labels
+        # back; one never used is only made. (A deletion is first met by its own run, on the label event.)
+        used = {e.get("label") for e in hub.tracker.repo_events(iso(now() - timedelta(days=90))) if e.get("event") == "labeled"}
+        if missing & used:
+            out, errors = guard_labels(hub)
+        else:
+            hub.ensure_labels()
     # Board issues changed lately, and any issue whose labels or state changed lately (one taken off the board is
     # no board issue any more), from the repository's event feed rather than one timeline per issue.
     numbers = {i["number"] for i in hub.tracker.list_issues(MARK, since=since) if (i.get("updated_at") or "") >= since}
