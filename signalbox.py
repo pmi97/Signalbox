@@ -22,6 +22,7 @@ import copy
 import fnmatch
 import functools
 import getpass
+import hashlib
 import hmac
 import io
 import json
@@ -189,7 +190,7 @@ def safe_json(text, limit=65536):
         return None
 
 
-META_KEYS = ("by", "at", "deps", "map", "paths", "guarded")
+META_KEYS = ("by", "at", "deps", "map", "paths", "guarded", "struck")
 MAX_DEPS = 200  # more is no plan anyone reads, and only costs whoever walks the graph
 
 
@@ -209,6 +210,8 @@ def clean_meta(meta):
     for key in ("by", "at", "guarded"):
         if key in out and not (isinstance(out[key], str) and len(out[key]) <= 100):
             out.pop(key)
+    if "struck" in out:
+        out["struck"] = [x for x in strs(out["struck"]) if len(x) <= 16][:500]
     out.pop("kind", None)  # a kind lives in its label, which the guard watches
     return out
 
@@ -4549,6 +4552,11 @@ def scope_line(ticket, why):
     return f"- [{ticket['title']}]({ticket.get('url') or '#' + str(ticket['number'])}): {' '.join(why.split())}"
 
 
+def line_print(line):
+    """A struck line's fingerprint, kept in the meta of the versions the guard writes."""
+    return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()[:16]
+
+
 def lines_of(text):
     return [line.rstrip() for line in (text or "").split("\n") if line.strip()]
 
@@ -4574,7 +4582,7 @@ def map_by_agent(hub, issue, good, new, cut, editor, struck=frozenset()):
             return sum(ref in line for line in written) <= closes
         # nothing a person struck off comes back, and nothing is there twice
         if new_l[:len(old_l)] == old_l and all(found) and len(set(added)) == len(added) and \
-                not any(x in old_l or x in struck for x in added) and all(room(ref, legit) for ref, legit in found):
+                not any(x in old_l or line_print(x) in struck for x in added) and all(room(ref, legit) for ref, legit in found):
             keep = set_section(keep, name, section(new, name))
         else:
             refused.append(what)
@@ -4609,8 +4617,10 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
         return bool({YOLO_LABEL, YOLO_STOP_LABEL} & own) or \
             yolo_covered_at(hub, issue["number"], cut.get("until") or t, event_id=cut.get("before"), depth=1, lane=None)
 
-    undone, struck = [], set()
     good_desc, good_meta = split_body(steps[0][0])
+    # Lines people struck off a map, from the version the walk starts at (a walk from the guard's own version picks
+    # up what it knew; a list anyone else wrote only makes the guard stricter) and from what it reads.
+    undone, struck = [], set(good_meta.get("struck") or [])
     for body, editor, t, seq in [tuple(x) + (None,) * (4 - len(x)) for x in steps[1:]]:
         rules = hub.at(t)
         if editor in rules.guard_logins:
@@ -4621,8 +4631,9 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
         labels_then = state_then["labels"] if state_then else set(issue["labels"])
         lane = guard_lane_in(hub, rules, labels_then)
         restricted = guard_restricted(rules, editor, issue)
-        if approved and restricted and len(body or "") > BODY_LIMIT - ROOM:
-            # so long the guard could not write beside it (a version of its own, a fix): none of it is kept
+        if approved and restricted and len(body or "") > BODY_LIMIT - ROOM >= len(join_body(good_desc, good_meta)):
+            # so long the guard could not write beside it (a version of its own, a fix): none of it is kept. (Where
+            # the good version itself leaves no room, a person made it so, and the agent is not to blame.)
             undone += [] if depth else [f"make approved work too long for the guard to keep it by @{editor}"]
             continue
         if depth:  # what the links and the map were is all a depth-1 walk is asked
@@ -4650,7 +4661,7 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
         else:
             if not restricted and not depth:  # a person's taking a line off a map is their decision, and stays
                 for name in ("Decisions so far", "Out of scope"):
-                    struck |= set(lines_of(section(good_desc, name))) - set(lines_of(section(r_desc, name)))
+                    struck |= {line_print(x) for x in set(lines_of(section(good_desc, name))) - set(lines_of(section(r_desc, name)))}
             good_desc = r_desc
             good_meta["map"] = r_meta.get("map")
         old, new = set(good_meta.get("deps") or []), set(r_meta.get("deps") or [])
@@ -4665,27 +4676,30 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
             else:
                 old |= new - old
         good_meta["deps"] = sorted(old)
-        good_meta.update({k: v for k, v in r_meta.items() if k not in ("deps", "map")})
+        good_meta.update({k: v for k, v in r_meta.items() if k not in ("deps", "map", "struck")})
         if maps is not None:
             maps.append((seq, t, good_meta.get("map")))
+    if struck:
+        good_meta["struck"] = sorted(struck)
     return good_desc, good_meta, undone
 
 
 def history_walk(hub, revisions):
-    """The versions of a description to walk: all of them; where GitHub's history is cut off, or a version was
-    deleted from it, those from the newest version the guard wrote after the gap (it writes only versions it found
-    good); None where neither can be had."""
+    """The versions of a description to walk: all of them; where GitHub's history is cut off, those from the newest
+    version the guard wrote (it writes only versions it found good); None where neither can be had.
+
+    A version deleted from the history (people delete one that held a secret) is passed over: the next version is
+    judged against the last good one, so what an agent wrote in it never stands, and what a person wrote in it is,
+    at worst, put back to the text before it."""
     if not revisions:
         return None
-    # The walk never takes the guard's own versions as content, so one deleted from the history loses nothing.
-    revisions = [r for r in revisions if not (r.get("deleted") and guard_wrote(hub, r.get("editor"), parse_iso(r.get("at"))))]
+    cut = revisions[0].get("cut")
+    revisions = [r for r in revisions if not r.get("deleted")]
     if not revisions:
         return None
-    deleted = [i for i, r in enumerate(revisions) if r.get("deleted")]
-    if not deleted and not revisions[0].get("cut"):
+    if not cut:
         return revisions
-    start = deleted[-1] + 1 if deleted else 0  # the oldest version read is whole; a deleted one is not
-    for i in range(len(revisions) - 1, start - 1, -1):
+    for i in range(len(revisions) - 1, -1, -1):
         if guard_wrote(hub, revisions[i].get("editor"), parse_iso(revisions[i].get("at"))):
             return [dict(r, cut=False) for r in revisions[i:]]
     return None
@@ -4811,7 +4825,9 @@ def guard_texts(hub, issue, events, edit=None):
     pulled = set(meta.get("deps") or []) - set(deps)
     new_meta = dict(good_meta, deps=deps, map=good_meta.get("map"))
     body = join_body(good_desc, new_meta)
-    if (good_desc, deps, new_meta.get("map")) != (desc, sorted(meta.get("deps") or []), meta.get("map")):
+    def comparable(m):  # what a version says, less the guard's own bookkeeping
+        return {k: sorted(v) if k == "deps" else v for k, v in m.items() if k not in ("guarded", "struck") and v not in (None, [], "")}
+    if (good_desc, comparable(new_meta)) != (desc, comparable(meta)):
         fixes["body"] = body
         undone += walked
     else:
@@ -4819,7 +4835,8 @@ def guard_texts(hub, issue, events, edit=None):
                      len(walk))
         if since >= ANCHOR_EVERY:  # a version of its own, so a flood of edits never blinds it
             # stamped with the count too: two anchors in one second must still differ, or no version is made
-            anchor = join_body(desc, dict(meta, guarded=f"{iso(now())} after {len(walk)} versions"))
+            anchor = join_body(desc, dict(meta, guarded=f"{iso(now())} after {len(walk)} versions",
+                                          **({"struck": good_meta["struck"]} if good_meta.get("struck") else {})))
             if len(anchor) <= BODY_LIMIT:
                 fixes["body"] = anchor
     return fixes, undone, pulled if "body" in fixes and pulled else set(), None

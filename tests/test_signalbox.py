@@ -1897,14 +1897,25 @@ class GuardVerifyEighth(World):
             self.assertIn("rewrite approved work", self.guard(2, "edited", sender="acme-bot", changes=changes))
         self.assertEqual(S.split_body(t.get_issue(2)["body"])[0], "Run the tests and get security's sign-off first.")
 
-    def test_a_deleted_version_is_a_gap_in_the_history(self):
+    def test_a_deleted_version_is_passed_over(self):
         hub = self.gh()
         revs = [{"body": "v1", "editor": "alice", "at": "2026-01-01T00:00:00Z"},
                 {"body": "", "editor": "alice", "at": "2026-01-02T00:00:00Z", "deleted": True},
                 {"body": "v3", "editor": "acme-bot", "at": "2026-01-03T00:00:00Z"}]
-        self.assertIsNone(S.history_walk(hub, revs))
-        revs.append({"body": "v3", "editor": "github-actions[bot]", "at": "2026-01-04T00:00:00Z"})
-        self.assertEqual([r["body"] for r in S.history_walk(hub, revs)], ["v3"])
+        self.assertEqual([r["body"] for r in S.history_walk(hub, revs)], ["v1", "v3"])
+        # an agent's two rewrites, the first deleted from the history: the second is judged against the good text
+        self.sb("propose", "Docs", "Release", "Tag only after the security review.", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.rewrite(1, "Tag now.")
+        changes = self.rewrite(1, "Tag now; the review is not needed.")
+        real = S.FileTracker.body_revisions
+
+        def first_rewrite_deleted(self_, n):
+            revs = real(self_, n)
+            return revs[:-2] + [dict(revs[-2], body="", deleted=True), revs[-1]]
+        with mock.patch.object(S.FileTracker, "body_revisions", first_rewrite_deleted):
+            self.assertIn("rewrite approved work", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(1)["body"])[0], "Tag only after the security review.")
 
     def test_with_a_guard_of_its_own_no_bot_rewrites_approved_work(self):
         path = os.path.join(self.alice, ".signalbox", "config.json")
@@ -2003,6 +2014,62 @@ class GuardVerifyNinth(World):
         self.assertIn("rewrite a map's decisions", self.guard(1, "edited", sender="acme-bot", changes=changes))
         decisions = S.section(S.split_body(a.get_issue(1)["body"])[0], "Decisions so far")
         self.assertEqual([x.rsplit(": ", 1)[1] for x in decisions.splitlines()], ["argon2id"])
+
+
+class GuardVerifyTenth(World):
+    """The tenth verification of the guard: each scenario as the reviewer wrote it, and the legitimate flows."""
+
+    config = GuardVerifySeventh.config
+    as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
+    bot = dict(user="acme-bot", agent="claude-code")
+    gh, rewrite = GuardVerifyFifth.gh, GuardVerifySixth.rewrite
+
+    def paged(self, keep):
+        real = S.FileTracker.body_revisions
+        return lambda self_, n: (lambda revs: revs if len(revs) <= keep else [dict(revs[-keep], cut=True)] + revs[-keep + 1:])(real(self_, n))
+
+    def test_a_meta_grown_past_the_room_is_put_back(self):
+        self.sb("propose", "Docs", "Release", "Tag only after the security review.", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        t = self.as_("acme-bot")
+        with mock.patch.object(S, "BODY_LIMIT", 3000):
+            d, m = S.split_body(t.get_issue(1)["body"])
+            t.update_issue(1, body=S.join_body(d, dict(m, paths=["src/" + "x" * 290 + str(i) for i in range(9)])))
+            self.assertIn("too long for the guard", self.guard(1, "edited", sender="acme-bot"))
+        self.assertIsNone(S.split_body(t.get_issue(1)["body"])[1].get("paths"))
+
+    def test_a_person_deleting_their_own_version_blinds_nothing(self):
+        self.sb("propose", "Docs", "Release", "Tag only after the security review.", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.rewrite(1, "Tag only after the security review. Token: ghp_secret", who="alice")
+        self.rewrite(1, "Tag only after the security review.", who="alice")
+        changes = self.rewrite(1, "Tag now; no review.")
+        real = S.FileTracker.body_revisions
+
+        def secret_deleted(self_, n):
+            return [dict(r, body="", deleted=True) if "ghp_secret" in r["body"] else r for r in real(self_, n)]
+        with mock.patch.object(S.FileTracker, "body_revisions", secret_deleted):
+            self.assertIn("rewrite approved work", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(1)["body"])[0], "Tag only after the security review.")
+
+    def test_a_struck_line_is_remembered_past_a_cut(self):
+        GuardVerifyNinth.test_an_answer_a_person_struck_off_does_not_come_back(self)  # alice strikes MD5 off
+        a = self.as_("alice")
+        md5 = "- [Pick a password hash](" + a.get_issue(2)["url"] + "): MD5 is fine"
+        with mock.patch.object(S, "ANCHOR_EVERY", 5), mock.patch.object(S.FileTracker, "body_revisions", self.paged(12)):
+            for i in range(20):  # the agent charts fog until alice's version is out of the history read
+                self.guard(1, "edited", sender="acme-bot", changes=self.rewrite(
+                    1, fn=lambda d, i=i: S.set_section(d, "Not yet specified", f"- question {i}")))
+            changes = self.rewrite(1, fn=lambda d: S.set_section(d, "Decisions so far", S.section(d, "Decisions so far") + "\n" + md5))
+            self.assertIn("rewrite a map's decisions", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        self.assertNotIn("MD5", S.section(S.split_body(a.get_issue(1)["body"])[0], "Decisions so far"))
+
+    def test_an_agent_claims_a_long_task_a_person_wrote(self):
+        self.sb("propose", "Docs", "Importer", "spec " * 600, tty=True)  # a person's task is approved as it is added
+        with mock.patch.object(S, "BODY_LIMIT", 3000):
+            self.sb("claim", "SB-1", "--no-worktree", "--paths", "src/importer/**", **self.bot)
+            self.assertIsNone(self.guard(1, "edited", sender="acme-bot"))
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(1)["body"])[1].get("paths"), ["src/importer/**"])
 
 
 class Security(World):
