@@ -10,11 +10,8 @@ name: signalbox-guard
 on:
   issues:
     types: [labeled, unlabeled, closed, reopened, edited]
-  # Deleting or renaming a label changes every issue that wears it, with no event on any of them.
-  label:
-    types: [deleted, edited]
   schedule:
-    - cron: "23 * * * *"  # every hour: judge again what a failed or cancelled run left
+    - cron: "23 * * * *"  # every hour: judge again what a failed or cancelled run left, and labels changed repository-wide
 
 permissions:
   issues: write

@@ -1128,7 +1128,7 @@ class GuardVerifyThird(World):
         with mock.patch.object(S.FileTracker, "list_events", counting):
             out, errors = S.guard_sweep(self.gh())
         self.assertEqual((errors, len(out)), ([], 1))
-        self.assertLessEqual(calls["list_events"], 3)
+        self.assertLessEqual(calls["list_events"], 3 + S.LABEL_SAMPLE)  # and the few it compares with their history
 
 
 class GuardVerifyFourth(World):
@@ -2216,11 +2216,34 @@ class GuardVerifyFourteenth(World):
         t.delete_label("sb:todo")  # every approval gone, with no event on any issue...
         t.update_label("sb:proposed", new_name="sb:todo")  # ...and every proposal looks approved
         self.assertEqual((self.state("SB-1"), self.state("SB-2")), ("proposed", "todo"))
-        out = S.guard_event(self.gh(), {"action": "edited", "label": {"name": "sb:todo"},
-                                        "changes": {"name": {"from": "sb:proposed"}}, "sender": {"login": "acme-bot"}})
-        self.assertIn("put back", out)
+        out, errors = S.guard_sweep(self.gh())
+        self.assertEqual(errors, [])
+        self.assertIn("put back", "; ".join(out))
         self.assertEqual((self.state("SB-1"), self.state("SB-2")), ("todo", "proposed"))
         self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+
+    def test_two_labels_swapped_are_put_back(self):
+        self.make_board()
+        t = self.as_("acme-bot")  # no label goes missing: only the issues tell
+        t.update_label("sb:todo", new_name="tmp")
+        t.update_label("sb:proposed", new_name="sb:todo")
+        t.update_label("tmp", new_name="sb:proposed")
+        self.assertEqual((self.state("SB-1"), self.state("SB-2")), ("proposed", "todo"))
+        S.guard_sweep(self.gh())
+        self.assertEqual((self.state("SB-1"), self.state("SB-2")), ("todo", "proposed"))
+
+    def test_a_lane_a_person_renames_stays_renamed(self):
+        self.make_board()
+        path = os.path.join(self.alice, ".signalbox", "config.json")
+        cfg = json.loads(read(path))
+        cfg["lanes"] = [dict(x, name="Documentation") if x["name"] == "Docs" else x for x in cfg["lanes"]]
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        sh("git", "commit", "-qam", "Docs is Documentation now", cwd=self.alice)
+        self.as_("alice").update_label("lane:Docs", new_name="lane:Documentation")
+        S.guard_sweep(self.gh())
+        self.assertIn("lane:Documentation", self.labels(1))
+        self.assertNotIn("lane:Docs", self.labels(1))
 
     def test_the_board_label_deleted_is_put_back_by_the_sweep(self):
         self.make_board()

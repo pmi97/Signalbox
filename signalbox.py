@@ -691,6 +691,8 @@ EDIT_PAGES = 10  # pages of a hundred versions the guard reads of a description'
 ANCHOR_EVERY = 300
 MOVE_SECONDS = 120  # a lane taken off and another put on by the same account this soon after is one move
 ROOM = 1024  # characters under GitHub's limit an agent's version of approved work must leave, for the guard's writes
+LABEL_SAMPLE = 5  # board issues the sweep compares with their history each hour, to see labels changed repository-wide
+RESTORE_MAX = 100  # board issues one sweep puts labels back on, at most (the rest in the next hours)
 TRUSTED_BOTS = frozenset({"github-actions[bot]"})  # every workflow of the repository, on any branch, writes as it
 
 
@@ -4973,28 +4975,52 @@ def guard_reconcile(hub, n, edit=None, force=frozenset()):
     return "; ".join(dict.fromkeys(done)) or None
 
 
-def watched_labels(hub):
-    """The labels a board's decisions live in: deleting or renaming one at repository level changes every issue
-    that wore it, and GitHub records no event on any of them."""
-    return (set(LABEL_COLORS) - {LOCK_LABEL}) | {KIND_PREFIX + k for k in KINDS[1:]} | \
-        {x["label"] for x in hub.lanes() if x.get("configured")}
+def decision_labels():
+    """The labels a board's decisions show in. Deleting, renaming or swapping one at repository level changes every
+    issue that wears it, with no event on any: the guard's verdicts (read from events) stand, but the board, the CLI
+    and the agents see the wrong state until the labels are put back. Lanes are not among them: people rename lanes
+    on purpose, and a lane label gone leaves its work to the approvers of no lane."""
+    return {MARK, YOLO_LABEL, YOLO_STOP_LABEL} | set(STATE_LABELS.values()) | {KIND_PREFIX + k for k in KINDS[1:]}
+
+
+def labels_drifted(hub):
+    """Whether the board's labels were changed for the whole repository: the board label is gone, or a few board
+    issues (a different few each hour) wear other ones than their history leaves. (Another label missing may never
+    have been made: it only matters where an issue should wear it, which the few issues show.)"""
+    hub._labels = None
+    if MARK not in {lab["name"] for lab in hub.labels()}:
+        return True
+    board = sorted(guard_issues(hub), key=lambda i: i["number"])
+    if not board:
+        return False
+    start = (now().hour * LABEL_SAMPLE) % len(board)
+    for issue in (board[start:] + board[:start])[:LABEL_SAMPLE]:
+        legit, violations = guard_replay(hub, issue, guard_events(hub, issue["number"]))
+        want = legit["labels"] & decision_labels()
+        # a refused change explains a difference (its own run, or this sweep, undoes it); none explains this one
+        if not violations and legit["open"] == (issue["state"] == "open") and want != set(issue["labels"]) & decision_labels():
+            return True
+    return False
 
 
 def guard_labels(hub):
-    """Put the board's labels back after a change at repository level: make the missing ones again, then give
-    every board issue the ones its legitimate history leaves, by name. Returns (what was put back, errors)."""
-    force = watched_labels(hub)
+    """Put the board's labels back after a change at repository level: make the missing ones, then give board
+    issues (at most RESTORE_MAX a run, the most recently updated first) the decision labels their legitimate
+    history leaves, by name. The sweep alone does it, once an hour at most, so no run of label changes can
+    spend the guard's budget. Returns (what was put back, errors)."""
     hub._labels = None
+    gone_mark = MARK not in {lab["name"] for lab in hub.labels()}
     hub.ensure_labels()
+    issues = {i["number"]: i for i in guard_issues(hub)}
+    if gone_mark:  # the board label itself is gone: board issues are also known by the meta Signalbox writes
+        issues.update({i["number"]: i for i in hub.tracker.list_issues(None) if split_body(i.get("body") or "")[1]})
+    order = sorted(issues.values(), key=lambda i: i.get("updated_at") or "", reverse=True)[:RESTORE_MAX]
     out, errors = [], []
-    issues = {i["number"] for i in hub.tracker.list_issues(MARK)}
-    # The board label itself may be the one gone: board issues are also known by the meta Signalbox writes.
-    issues |= {i["number"] for i in hub.tracker.list_issues(None) if split_body(i.get("body") or "")[1]}
-    for n in sorted(issues):
+    for issue in order:
         try:
-            done = guard_reconcile(hub, n, force=force)
+            done = guard_reconcile(hub, issue["number"], force=decision_labels())
         except Exception as e:  # one issue's trouble never stops the others
-            errors.append(f"#{n}: {type(e).__name__}: {e}")
+            errors.append(f"#{issue['number']}: {type(e).__name__}: {e}")
             done = None
         if done:
             out.append(done)
@@ -5005,15 +5031,6 @@ def guard_labels(hub):
 def guard_event(hub, event):
     """Undo human-only decisions made on GitHub by accounts that may not make them. Returns what was undone."""
     issue = event.get("issue") or {}
-    label = event.get("label") if isinstance(event.get("label"), dict) else {}
-    if not issue.get("number") and label and event.get("action") in ("deleted", "edited"):
-        old = ((event.get("changes") or {}).get("name") or {}).get("from")
-        if {label.get("name"), old} & watched_labels(hub):
-            out, errors = guard_labels(hub)
-            if errors:
-                raise SignalboxError("; ".join(errors))
-            return "\n".join(out) or None
-        return None
     if not issue.get("number"):
         return None
     return guard_reconcile(hub, issue["number"], edit=event if event.get("action") == "edited" else None)
@@ -5024,16 +5041,10 @@ def guard_sweep(hub, days=3):
     left, the sweep puts right. Returns (undone, errors); one issue's trouble never stops the others."""
     since = iso(now() - timedelta(days=days))
     out, errors = [], []
-    hub._labels = None
-    missing = watched_labels(hub) - {lab["name"] for lab in hub.labels()}
-    if missing:
-        # A board label is gone, with no event on any issue. If issues wore it lately, put every board issue's labels
-        # back; one never used is only made. (A deletion is first met by its own run, on the label event.)
-        used = {e.get("label") for e in hub.tracker.repo_events(iso(now() - timedelta(days=90))) if e.get("event") == "labeled"}
-        if missing & used:
-            out, errors = guard_labels(hub)
-        else:
-            hub.ensure_labels()
+    if labels_drifted(hub):  # labels changed for the whole repository: put them back, a bounded batch an hour
+        out, errors = guard_labels(hub)
+    elif (set(LABEL_COLORS) | decision_labels()) - {lab["name"] for lab in hub.labels()}:
+        hub.ensure_labels()  # missing, but worn by none of the issues looked at: only made again
     # Board issues changed lately, and any issue whose labels or state changed lately (one taken off the board is
     # no board issue any more), from the repository's event feed rather than one timeline per issue.
     numbers = {i["number"] for i in hub.tracker.list_issues(MARK, since=since) if (i.get("updated_at") or "") >= since}
