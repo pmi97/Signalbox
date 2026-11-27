@@ -683,6 +683,7 @@ EDIT_PAGES = 10  # pages of a hundred versions the guard reads of a description'
 # meta), so a history never grows past what it reads without a version known good to walk from.
 ANCHOR_EVERY = 300
 MOVE_SECONDS = 120  # a lane taken off and another put on by the same account this soon after is one move
+ROOM = 1024  # characters under GitHub's limit an agent's version of approved work must leave, for the guard's writes
 TRUSTED_BOTS = frozenset({"github-actions[bot]"})  # every workflow of the repository, on any branch, writes as it
 
 
@@ -4140,7 +4141,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
     sl = STATE_LABELS
     lanes_now = {x["label"]: x for x in hub.lanes()}
     legit = {"labels": set(), "open": True, "reason": None, "closed_from": None, "closed_at": None, "closed_by": None,
-             "done_closes": 0, "closes": 0, "marks": [], "grants": {}}
+             "done_closes": 0, "closes": 0, "done_before": None, "last_done": None, "marks": [], "grants": {}}
     violations = []
     created = parse_iso(issue.get("created_at"))
     author = login_of(issue.get("user"))
@@ -4159,7 +4160,7 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
             trace.append((parse_iso(e.get("created_at")) if e else None, e.get("id") if e else None,
                           {"labels": frozenset(legit["labels"]), "open": legit["open"], "reason": legit["reason"],
                            "closed_from": legit["closed_from"], "closed_at": legit["closed_at"], "closed_by": legit["closed_by"],
-                           "done_closes": legit["done_closes"], "closes": legit["closes"],
+                           "done_closes": legit["done_closes"], "closes": legit["closes"], "done_before": legit["done_before"],
                            "grants": dict(legit["grants"])}))
 
     # The labels an issue is created with arrive as separate events; judge them as one change, the creation. GitHub
@@ -4289,6 +4290,8 @@ def guard_replay(hub, issue, events, until=None, depth=0, before=None, trace=Non
             legit["grants"].pop(label, None) if actor not in bots else None
         elif kind == "closed":
             if is_open:
+                if reason == "completed":  # when it was last done before this close (reopens do not forget it)
+                    legit["done_before"], legit["last_done"] = legit["last_done"], t
                 legit.update(closed_from=cur, closed_at=t, closed_by=actor)
                 legit["done_closes"] += reason == "completed"
                 legit["closes"] += 1
@@ -4441,14 +4444,15 @@ def resolution_gist(hub, ticket, until=None, comments=None):
     return "resolved"
 
 
-def resolution_gists(hub, ticket, until, comments):
-    """The gists of every answer a ticket was given (resolution notes from the team, as posted) up to `until`:
-    GitHub's times are whole seconds, so a close and the answers around it cannot always be told apart."""
+def resolution_gists(hub, ticket, until, comments, since=None):
+    """The gists of the answers a ticket was given for one close (resolution notes from the team, as posted), from
+    the close before it (`since`) to it (`until`), both included: GitHub's times are whole seconds, so a close and
+    the answers around it cannot always be told apart."""
     out = []
     for c in comments:
         note = parse_note(c, hub.team)
         at = parse_iso(note.get("at"))
-        if until and at and at > until:
+        if until and at and at > until or since and at and at < since:
             continue
         if note.get("kind") == "resolution" and note_trusted(note) and note["text"].startswith("Resolution:"):
             answer = note["text"][len("Resolution:"):].strip()
@@ -4513,7 +4517,8 @@ def decision_lines(hub, map_n, cut, editor):
         memo[key] = {decision_line(ticket, gist): (ticket_ref(ticket), legit)
                      for ticket, legit in map_tickets(hub, map_n, cut, done=True)
                      if kind_in(legit["labels"]) in DECISION_KINDS and legit.get("closed_by") == editor
-                     for gist in resolution_gists(hub, ticket, legit.get("closed_at"), guard_comments(hub, ticket["number"]))}
+                     for gist in resolution_gists(hub, ticket, legit.get("closed_at"), guard_comments(hub, ticket["number"]),
+                                                  since=legit.get("done_before"))}
     return memo[key]
 
 
@@ -4548,7 +4553,7 @@ def lines_of(text):
     return [line.rstrip() for line in (text or "").split("\n") if line.strip()]
 
 
-def map_by_agent(hub, issue, good, new, cut, editor):
+def map_by_agent(hub, issue, good, new, cut, editor, struck=frozenset()):
     """An agent account's version of an approved map, kept where agents may write: its fog (Not yet specified), and
     the one line each ticket of the map it finished or ruled out itself adds to Decisions so far or Out of scope.
     The rest, those sections' earlier lines included, is the people's. Returns (description, what was refused)."""
@@ -4567,8 +4572,9 @@ def map_by_agent(hub, issue, good, new, cut, editor):
             """A line for each time the ticket was closed so: a decision reopened and resolved again adds a new one."""
             closes = legit["done_closes"] if what == "decisions" else legit["closes"] - legit["done_closes"]
             return sum(ref in line for line in written) <= closes
+        # nothing a person struck off comes back, and nothing is there twice
         if new_l[:len(old_l)] == old_l and all(found) and len(set(added)) == len(added) and \
-                all(room(ref, legit) for ref, legit in found):
+                not any(x in old_l or x in struck for x in added) and all(room(ref, legit) for ref, legit in found):
             keep = set_section(keep, name, section(new, name))
         else:
             refused.append(what)
@@ -4603,7 +4609,7 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
         return bool({YOLO_LABEL, YOLO_STOP_LABEL} & own) or \
             yolo_covered_at(hub, issue["number"], cut.get("until") or t, event_id=cut.get("before"), depth=1, lane=None)
 
-    undone = []
+    undone, struck = [], set()
     good_desc, good_meta = split_body(steps[0][0])
     for body, editor, t, seq in [tuple(x) + (None,) * (4 - len(x)) for x in steps[1:]]:
         rules = hub.at(t)
@@ -4615,6 +4621,10 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
         labels_then = state_then["labels"] if state_then else set(issue["labels"])
         lane = guard_lane_in(hub, rules, labels_then)
         restricted = guard_restricted(rules, editor, issue)
+        if approved and restricted and len(body or "") > BODY_LIMIT - ROOM:
+            # so long the guard could not write beside it (a version of its own, a fix): none of it is kept
+            undone += [] if depth else [f"make approved work too long for the guard to keep it by @{editor}"]
+            continue
         if depth:  # what the links and the map were is all a depth-1 walk is asked
             if not (approved and restricted):
                 good_meta["map"] = r_meta.get("map")
@@ -4623,8 +4633,8 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
                 # the map as it was when this version was written, that second included: a ticket's close and
                 # the line it adds to its map come together
                 cut = {"before": seq} if isinstance(seq, int) else {"until": t} if t else {}
-                kept, refused = map_by_agent(hub, issue, good_desc, r_desc, cut, editor)
-                if refused and kept != good_desc and len(join_body(kept, dict(good_meta, **r_meta))) > BODY_LIMIT - 1024:
+                kept, refused = map_by_agent(hub, issue, good_desc, r_desc, cut, editor, struck)
+                if kept != good_desc and len(join_body(kept, dict(good_meta, **r_meta))) > BODY_LIMIT - ROOM:
                     # the agent's part beside the people's would be too long for GitHub to take: the last good
                     # version stays whole (an agent's own version, nothing refused, is as long as it wrote it)
                     kept, refused = good_desc, refused + ["long"]
@@ -4638,6 +4648,9 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
             if r_meta.get("map") != good_meta.get("map"):
                 undone.append(f"move approved work to another map by @{editor}")
         else:
+            if not restricted and not depth:  # a person's taking a line off a map is their decision, and stays
+                for name in ("Decisions so far", "Out of scope"):
+                    struck |= set(lines_of(section(good_desc, name))) - set(lines_of(section(r_desc, name)))
             good_desc = r_desc
             good_meta["map"] = r_meta.get("map")
         old, new = set(good_meta.get("deps") or []), set(r_meta.get("deps") or [])
@@ -4662,6 +4675,10 @@ def history_walk(hub, revisions):
     """The versions of a description to walk: all of them; where GitHub's history is cut off, or a version was
     deleted from it, those from the newest version the guard wrote after the gap (it writes only versions it found
     good); None where neither can be had."""
+    if not revisions:
+        return None
+    # The walk never takes the guard's own versions as content, so one deleted from the history loses nothing.
+    revisions = [r for r in revisions if not (r.get("deleted") and guard_wrote(hub, r.get("editor"), parse_iso(r.get("at"))))]
     if not revisions:
         return None
     deleted = [i for i, r in enumerate(revisions) if r.get("deleted")]
@@ -4802,7 +4819,9 @@ def guard_texts(hub, issue, events, edit=None):
                      len(walk))
         if since >= ANCHOR_EVERY:  # a version of its own, so a flood of edits never blinds it
             # stamped with the count too: two anchors in one second must still differ, or no version is made
-            fixes["body"] = join_body(desc, dict(meta, guarded=f"{iso(now())} after {len(walk)} versions"))
+            anchor = join_body(desc, dict(meta, guarded=f"{iso(now())} after {len(walk)} versions"))
+            if len(anchor) <= BODY_LIMIT:
+                fixes["body"] = anchor
     return fixes, undone, pulled if "body" in fixes and pulled else set(), None
 
 

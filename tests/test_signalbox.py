@@ -1464,7 +1464,8 @@ class GuardVerifySixth(World):
                 raise S.SignalboxError("GitHub refused PATCH: 422 body is too long")
             return real(self_, number, **fields)
         with mock.patch.object(S.FileTracker, "update_issue", github_limit):
-            self.assertIn("rewrite a map", self.guard(1, "edited", sender="acme-bot", changes={"body": {"from": before["body"]}}))
+            # so long the guard could not write beside it: none of it is kept
+            self.assertIn("too long for the guard", self.guard(1, "edited", sender="acme-bot", changes={"body": {"from": before["body"]}}))
             self.assertEqual(S.guard_sweep(self.gh()), ([], []))
         self.assertEqual(S.split_body(t.get_issue(1)["body"])[0], desc)
         self.assertEqual(len(t.list_comments(1)), 1)
@@ -1948,6 +1949,60 @@ class GuardVerifyEighth(World):
         self.assertEqual(S.guard_sweep(self.gh()), ([], []))
         decisions = S.section(S.split_body(a.get_issue(1)["body"])[0], "Decisions so far")
         self.assertEqual([line.rsplit(": ", 1)[1] for line in decisions.splitlines()], ["GitHub OAuth", "Okta, after all"])
+
+
+class GuardVerifyNinth(World):
+    """The ninth verification of the guard: each scenario as the reviewer wrote it."""
+
+    config = GuardVerifySeventh.config
+    as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
+    bot = dict(user="acme-bot", agent="claude-code")
+    gh, rewrite = GuardVerifyFifth.gh, GuardVerifySixth.rewrite
+
+    def test_an_agent_leaves_room_for_the_guard(self):
+        self.sb("map", "new", "Login", "--destination", "Users log in with SSO", "--lane", "Docs", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        with mock.patch.object(S, "BODY_LIMIT", 4000):
+            changes = self.rewrite(1, fn=lambda d: S.set_section(d, "Not yet specified", "- " + "x" * 3500))
+            self.assertIn("too long for the guard", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        self.assertLess(len(self.as_("alice").get_issue(1)["body"]), 1000)
+
+    def test_deleting_the_guards_version_blinds_nothing(self):
+        self.sb("propose", "Docs", "Release", "Tag only after the security review.", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.assertIn("rewrite approved work", self.guard(1, "edited", sender="acme-bot", changes=self.rewrite(1, "Tag now.")))
+        changes = self.rewrite(1, "Tag now; the review is not needed.")
+        real = S.FileTracker.body_revisions
+
+        def guard_version_deleted(self_, n):
+            return [dict(r, body="", deleted=True) if r["editor"] == "github-actions[bot]" else r for r in real(self_, n)]
+        with mock.patch.object(S.FileTracker, "body_revisions", guard_version_deleted):
+            self.assertIn("rewrite approved work", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        self.assertEqual(S.split_body(self.as_("alice").get_issue(1)["body"])[0], "Tag only after the security review.")
+
+    def test_an_answer_a_person_struck_off_does_not_come_back(self):
+        self.sb("map", "new", "Login", "--destination", "Users log in with SSO", "--lane", "Docs", **self.bot)
+        self.sb("approve", "SB-1", tty=True)
+        self.sb("propose", "Docs", "Pick a password hash", "--map", "SB-1", "--kind", "research", **self.bot)
+        self.sb("approve", "SB-2", tty=True)
+        self.sb("propose", "Docs", "Login head", "--deps", "SB-2", tty=True)
+        self.sb("yolo", "SB-3", "on", tty=True)
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        self.sb("resolve", "SB-2", "-m", "MD5 is fine", **self.bot)
+        self.guard(2, "closed", sender="acme-bot")
+        a = self.as_("alice")
+        md5 = S.section(S.split_body(a.get_issue(1)["body"])[0], "Decisions so far")
+        a.update_issue(2, state="open")  # alice reopens it and strikes the answer off the map
+        a.add_labels(2, ["sb:todo"])
+        self.rewrite(1, fn=lambda d: S.set_section(d, "Decisions so far", ""), who="alice")
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        self.sb("resolve", "SB-2", "-m", "argon2id", **self.bot)
+        self.guard(2, "closed", sender="acme-bot")
+        self.assertIsNone(self.guard(1, "edited", sender="acme-bot"))
+        changes = self.rewrite(1, fn=lambda d: S.set_section(d, "Decisions so far", S.section(d, "Decisions so far") + "\n" + md5))
+        self.assertIn("rewrite a map's decisions", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        decisions = S.section(S.split_body(a.get_issue(1)["body"])[0], "Decisions so far")
+        self.assertEqual([x.rsplit(": ", 1)[1] for x in decisions.splitlines()], ["argon2id"])
 
 
 class Security(World):
