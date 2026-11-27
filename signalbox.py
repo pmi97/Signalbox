@@ -192,7 +192,7 @@ def safe_json(text, limit=65536):
 
 META_KEYS = ("by", "at", "deps", "map", "paths", "guarded", "struck")
 MAX_DEPS = 200  # more is no plan anyone reads, and only costs whoever walks the graph
-MAX_STRUCK = 64  # lines struck off a map the guard remembers (the newest), so its own writes stay small
+MAX_STRUCK = 256  # lines struck off a map the guard remembers (the newest); left out of a write that would not fit
 
 
 def clean_meta(meta):
@@ -4367,6 +4367,11 @@ def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None, reach=False
     covered = False
     if heads:
         deps = {m: [d for d in split_body(i["body"])[1].get("deps") or [] if d in issues] for m, i in issues.items()}
+        if n in issues:
+            # The task's own links (a cycle back into a chain) as its history has them, from the start: the body the
+            # guard last wrote must never decide the next run's verdict.
+            got = legit_deps(hub, issues[n]) if not depth else deps_at(hub, issues[n], when, event_id)
+            deps[n] = [d for d in got if d in issues]
 
         def index():
             return {hub.tid(m).upper(): {"id": hub.tid(m), "title": "", "state": "todo", "deps": [hub.tid(d) for d in ds]}
@@ -4389,9 +4394,26 @@ def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None, reach=False
             key = hub.tid(h).upper()
             if key in waiting:
                 on_path |= (K._upstream(idx, idx[key]) & waiting) | {key}
-        for m in [m for m in deps if hub.tid(m).upper() in on_path]:
+        for m in [m for m in deps if hub.tid(m).upper() in on_path and m != n]:
             got = legit_deps(hub, issues[m]) if not depth else deps_at(hub, issues[m], when, event_id)
             deps[m] = [d for d in got if d in issues]
+        if depth:
+            # The link rule asks only whether the task was in a YOLO chain: whether a YOLO head waited on it then,
+            # cycles and stops or not. (Coverage below drops a head caught in a cycle, which is right for a finish
+            # under YOLO and wrong here: a cycle made later would let a link in.)
+            graph = {m: set(ds) for m, ds in deps.items()}
+            back, seen, stack = {}, set(), [n]
+            for m, ds in graph.items():
+                for d in ds:
+                    back.setdefault(d, []).append(m)
+            while stack:
+                for m in back.get(stack.pop(), []):
+                    if m not in seen:
+                        seen.add(m)
+                        stack.append(m)
+            covered = any(h in seen for h, (legit, _) in heads.items() if YOLO_LABEL in legit["labels"])
+            memo[key] = covered
+            return covered
         idx = index()
 
         def cover_with(yolo_heads):
@@ -4681,8 +4703,8 @@ def body_walk(hub, issue, events, steps, depth=0, maps=None):
                 old |= new - old
         good_meta["deps"] = sorted(old)
         theirs = {k: v for k, v in r_meta.items() if k not in ("deps", "map", "struck")}
-        if approved and restricted:
-            good_meta.update(theirs)  # an agent sets what it may (its paths), and takes nothing away
+        if approved and restricted:  # an agent sets what it may (its paths), and changes or takes nothing else
+            good_meta.update({k: v for k, v in theirs.items() if k == "paths"})
         else:
             good_meta = dict({k: good_meta[k] for k in ("deps", "map") if k in good_meta}, **theirs)
         if maps is not None:

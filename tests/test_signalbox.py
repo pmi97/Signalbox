@@ -2109,6 +2109,82 @@ class GuardVerifyEleventh(World):
         self.assertIn("by", S.split_body(a.get_issue(1)["body"])[1])
 
 
+class GuardVerifyTwelfth(World):
+    """The twelfth verification of the guard."""
+
+    config = GuardVerifySeventh.config
+    as_, guard, labels, approved = Guard.as_, Guard.guard, Guard.labels, Guard.approved
+    bot = dict(user="acme-bot", agent="claude-code")
+    gh, rewrite = GuardVerifyFifth.gh, GuardVerifySixth.rewrite
+
+    def link(self, who, n, deps):
+        t = self.as_(who)
+        before = t.get_issue(n)
+        d, m = S.split_body(before["body"])
+        t.update_issue(n, body=S.join_body(d, dict(m, deps=deps)))
+        return {"body": {"from": before["body"]}}
+
+    def test_a_link_that_closes_a_cycle_into_a_chain_is_refused_for_good(self):
+        self.sb("propose", "Docs", "A member", **self.bot)
+        self.sb("propose", "Docs", "B", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("propose", "Docs", "Head", "--deps", "SB-1", tty=True)
+        self.sb("yolo", "SB-3", "on", tty=True)
+        self.assertIsNone(self.guard(2, "edited", sender="carol", changes=self.link("carol", 2, [3])))  # B waits on the head
+        changes = self.link("carol", 1, [2])  # A waits on B: A -> B -> head -> A
+        self.assertIn("link work into a YOLO chain by @carol", self.guard(1, "edited", sender="carol", changes=changes))
+        for _ in range(3):  # and every later run agrees: the guard's own write never turns the verdict
+            self.assertIsNone(self.guard(1, "edited", sender="carol"))
+            self.assertIsNone(S.split_body(self.as_("alice").get_issue(1)["body"])[1].get("deps"))
+        self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+
+    def test_no_run_turns_the_verdict_of_the_one_before(self):
+        """The fuzz's seed 706: a link that closes a cycle through a YOLO head was refused and let in by turns, each
+        run's write deciding the next run's verdict, for ever."""
+        import random
+        rnd = random.Random(706)
+        actors = ["acme-bot", "carol", "dave", "alice"]
+        labels = ["sb:todo", "sb:doing", "sb:review", "sb:proposed", "sb:yolo", "sb:yolo-stop", "lane:Ops", "lane:Docs",
+                  "kind:map", "kind:research"]
+        self.sb("propose", "Docs", "A", **self.bot)
+        self.sb("propose", "Docs", "B", "--deps", "SB-1", **self.bot)
+        self.sb("propose", "Ops", "C", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("approve", "SB-3", user="dave", tty=True)
+        self.sb("propose", "Docs", "Head", "--deps", "SB-2", tty=True)
+        self.sb("yolo", "SB-4", "on", tty=True)
+        self.sb("propose", "Ops", "Ops head", "--deps", "SB-3", user="dave", tty=True)
+        self.sb("yolo", "SB-5", "on", user="dave", tty=True)
+        for _ in range(30):
+            t = self.as_(rnd.choice(actors))
+            n = rnd.randint(1, 5)
+            i, op = t.get_issue(n), rnd.random()
+            if op < 0.45:
+                lab = rnd.choice(labels)
+                t.remove_label(n, lab) if lab in i["labels"] else t.add_labels(n, [lab])
+            elif op < 0.6:
+                t.update_issue(n, state="closed", state_reason=rnd.choice(["completed", "not_planned"])) \
+                    if i["state"] == "open" else t.update_issue(n, state="open")
+            elif op < 0.85:
+                d, m = S.split_body(i["body"])
+                deps = sorted(set(rnd.sample(range(1, 6), rnd.randint(0, 2))) - {n})
+                t.update_issue(n, body=S.join_body(d + rnd.choice(["", " (edited)"]), dict(m, deps=deps)))
+            else:
+                t.update_issue(n, title=i["title"] + "!")
+        S.guard_sweep(self.gh())
+        for _ in range(3):
+            self.assertEqual(S.guard_sweep(self.gh()), ([], []))
+
+    def test_an_agent_cannot_re_sign_approved_work(self):
+        self.sb("propose", "Docs", "Work", tty=True)
+        t = self.as_("acme-bot")
+        d, m = S.split_body(t.get_issue(1)["body"])
+        t.update_issue(1, body=S.join_body(d, dict(m, by="claude-code", paths=["src/**"])))
+        self.guard(1, "edited", sender="acme-bot")
+        meta = S.split_body(self.as_("alice").get_issue(1)["body"])[1]
+        self.assertEqual((meta.get("by"), meta.get("paths")), (m.get("by"), ["src/**"]))
+
+
 class Security(World):
     """Each test pins down a hole that was open: who may act as whom, what text agents trust, what reaches git."""
 
