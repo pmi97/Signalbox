@@ -4398,8 +4398,8 @@ def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None, reach=False
             got = legit_deps(hub, issues[m]) if not depth else deps_at(hub, issues[m], when, event_id)
             deps[m] = [d for d in got if d in issues]
         if depth:
-            # The link rule asks only whether the task was in a YOLO chain: whether a YOLO head waited on it then,
-            # cycles and stops or not. (Coverage below drops a head caught in a cycle, which is right for a finish
+            # The link rule asks only whether the task was in a YOLO chain: whether a YOLO head or stop waited on it
+            # then, cycles or not. (Coverage below drops a head caught in a cycle, which is right for a finish
             # under YOLO and wrong here: a cycle made later would let a link in.)
             graph = {m: set(ds) for m, ds in deps.items()}
             back, seen, stack = {}, set(), [n]
@@ -4411,7 +4411,8 @@ def yolo_covered_at(hub, n, when, event_id=None, depth=0, lane=None, reach=False
                     if m not in seen:
                         seen.add(m)
                         stack.append(m)
-            covered = any(h in seen for h, (legit, _) in heads.items() if YOLO_LABEL in legit["labels"])
+            # A stop covers what it waits on as a YOLO head does (only its own task is reviewed), so both count.
+            covered = any(h in seen for h in heads)
             memo[key] = covered
             return covered
         idx = index()

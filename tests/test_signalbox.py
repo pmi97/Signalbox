@@ -2175,6 +2175,18 @@ class GuardVerifyTwelfth(World):
         for _ in range(3):
             self.assertEqual(S.guard_sweep(self.gh()), ([], []))
 
+    def test_no_link_into_what_a_yolo_stop_waits_on(self):
+        self.sb("propose", "Docs", "A member", **self.bot)
+        self.sb("propose", "Docs", "X work", **self.bot)
+        self.sb("approve", "SB-1", "SB-2", tty=True)
+        self.sb("propose", "Docs", "Release", "--deps", "SB-1", tty=True)
+        self.sb("yolo", "SB-3", "stop", tty=True)  # a stop alone: what SB-3 waits on goes under YOLO
+        self.assertIn("YOLO chain", self.sb("depend", "SB-1", "SB-2", code=None, **self.bot))
+        changes = self.link("acme-bot", 1, [2])
+        self.assertIn("link work into a YOLO chain", self.guard(1, "edited", sender="acme-bot", changes=changes))
+        self.sb("claim", "SB-2", "--no-worktree", **self.bot)
+        self.assertIn("doing -> review", self.sb("finish", "SB-2", "-m", "Done", **self.bot))
+
     def test_an_agent_cannot_re_sign_approved_work(self):
         self.sb("propose", "Docs", "Work", tty=True)
         t = self.as_("acme-bot")
